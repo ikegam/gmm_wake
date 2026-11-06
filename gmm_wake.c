@@ -224,6 +224,15 @@ static int gmm_build(struct gmm_dev *d)
 	if (!d->desc_va || !d->pt_va || !d->data_va)
 		return -ENOMEM;
 
+	/*
+	 * Quiesce first: clear any latched START from a previous run before we
+	 * reprogram DESBASE/pagedir, so the chip can't auto-fire mid-build.
+	 * GNA abort = CTRL bit2 (ABORT_CLR_ACCEL).
+	 */
+	iowrite32(BIT(2), d->bar + GNA_MMIO_CTRL);
+	udelay(50);
+	iowrite32(0, d->bar + GNA_MMIO_CTRL);
+
 	memset(d->desc_va, 0, PAGE_SIZE);
 	memset(d->pt_va, 0, PAGE_SIZE);
 	memset(d->data_va, 0, PAGE_SIZE);
