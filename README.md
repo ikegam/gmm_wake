@@ -103,6 +103,29 @@ Bidirectional control confirmed: we can read *and* write the chip's
 registers, and restore state cleanly. The `0x76543210`-filled banks at
 `0x800` and `0xc00` behave as writable scratch/descriptor RAM.
 
+### Full BAR0 writability sweep
+
+```
+writable = 77 dwords = 308 bytes   (fully writable scratch)
+partial  = 42 dwords               (some bits fixed)
+ro/zero  = 905 dwords
+total    = 1024 dwords (4096 B BAR)
+```
+
+Fully-writable ranges:
+
+| Range          | Size  | Note                                            |
+|----------------|-------|-------------------------------------------------|
+| `0x200–0x2fc`  | 256 B | Largest block; the former all-`0xffffffff` area |
+| `0x804..0x834` | 20 B  | +4 field of 12-byte records, bank A             |
+| `0xc04..0xc34` | 20 B  | +4 field of 12-byte records, bank B (mirror)    |
+| `0x054,0x0a0,0x404` | 12 B | scattered writable dwords                   |
+
+**Usable "memory" on the chip: 308 bytes fully writable, of which one
+contiguous 256-byte block at `0x200`.** The scratch banks are laid out as
+12-byte records with the writable field at +4, duplicated at `0x800` and
+`0xc00` — consistent with two identical engine/queue contexts.
+
 ## Safety
 
 Read path is safe. Any future write path targets only scratch-looking

@@ -198,20 +198,23 @@ static void gmm_run_sweep(struct gmm_dev *d)
 			(unsigned long long)(d->bar_len - 4),
 			(unsigned long long)(d->bar_len - run_start));
 
-	/* Independence test for the two scratch banks, if both are writable. */
-	if (0x800 + 4 <= d->bar_len && 0xc00 + 4 <= d->bar_len &&
-	    gmm_probe_dword(d, 0x800) == 0xffffffffu &&
-	    gmm_probe_dword(d, 0xc00) == 0xffffffffu) {
-		u32 o8 = ioread32(d->bar + 0x800);
-		u32 oc = ioread32(d->bar + 0xc00);
+	/*
+	 * Independence test for the two scratch banks. The writable field of
+	 * each 12-byte record sits at +4, so compare 0x804 vs 0xc04.
+	 */
+	if (0x804 + 4 <= d->bar_len && 0xc04 + 4 <= d->bar_len &&
+	    gmm_probe_dword(d, 0x804) == 0xffffffffu &&
+	    gmm_probe_dword(d, 0xc04) == 0xffffffffu) {
+		u32 o8 = ioread32(d->bar + 0x804);
+		u32 oc = ioread32(d->bar + 0xc04);
 		u32 seen_c;
 
-		iowrite32(0xdeadbeefu, d->bar + 0x800);
-		seen_c = ioread32(d->bar + 0xc00);
-		iowrite32(o8, d->bar + 0x800);
-		iowrite32(oc, d->bar + 0xc00);
+		iowrite32(0xdeadbeefu, d->bar + 0x804);
+		seen_c = ioread32(d->bar + 0xc04);
+		iowrite32(o8, d->bar + 0x804);
+		iowrite32(oc, d->bar + 0xc04);
 		u += scnprintf(d->sweep + u, sz - u,
-			"0x800 vs 0xc00 : %s\n",
+			"0x804 vs 0xc04 : %s\n",
 			seen_c == 0xdeadbeefu ? "ALIASED (same RAM)"
 					      : "INDEPENDENT (two banks)");
 	}
