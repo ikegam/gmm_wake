@@ -233,6 +233,79 @@ impl Drop for Speaker {
     }
 }
 
+// raw gated audio -> .wav (for offline verification without a feedback loop)
+struct WavOut {
+    f: BufWriter<File>,
+    n: u64,
+}
+impl WavOut {
+    fn create(path: &str) -> WavOut {
+        let mut f = BufWriter::new(File::create(path).expect("create wav"));
+        // placeholder header (sizes patched on finish)
+        f.write_all(b"RIFF\0\0\0\0WAVEfmt ").unwrap();
+        f.write_all(&16u32.to_le_bytes()).unwrap();
+        f.write_all(&1u16.to_le_bytes()).unwrap();              // PCM
+        f.write_all(&1u16.to_le_bytes()).unwrap();              // mono
+        f.write_all(&(SR as u32).to_le_bytes()).unwrap();
+        f.write_all(&((SR * 2) as u32).to_le_bytes()).unwrap(); // byte rate
+        f.write_all(&2u16.to_le_bytes()).unwrap();              // block align
+        f.write_all(&16u16.to_le_bytes()).unwrap();             // bits
+        f.write_all(b"data\0\0\0\0").unwrap();
+        WavOut { f, n: 0 }
+    }
+    fn write_hop(&mut self, samples: &[f32; HOP]) {
+        for i in 0..HOP {
+            let s = (samples[i].max(-1.0).min(1.0) * 32767.0) as i16;
+            self.f.write_all(&s.to_le_bytes()).unwrap();
+        }
+        self.n += HOP as u64;
+    }
+    fn finish(mut self) {
+        use std::io::Seek;
+        let data_len = (self.n * 2) as u32;
+        self.f.flush().unwrap();
+        let mut inner = self.f.into_inner().unwrap();
+        inner.seek(std::io::SeekFrom::Start(4)).unwrap();
+        inner.write_all(&(36 + data_len).to_le_bytes()).unwrap();
+        inner.seek(std::io::SeekFrom::Start(40)).unwrap();
+        inner.write_all(&data_len.to_le_bytes()).unwrap();
+    }
+}
+
+// Ensure a PipeWire virtual source exists so other apps can pick it as a mic.
+// Returns the module id (to optionally unload later). Idempotent.
+fn ensure_virtmic(name: &str) {
+    if let Ok(o) = Command::new("pactl").args(["list", "short", "modules"]).output() {
+        let s = String::from_utf8_lossy(&o.stdout);
+        if s.contains(&format!("sink_name={name}")) {
+            eprintln!("[virtmic] '{name}' already present");
+            return;
+        }
+    }
+    let st = Command::new("pactl")
+        .args(["load-module", "module-null-sink",
+               "media.class=Audio/Source/Virtual",
+               &format!("sink_name={name}"),
+               &format!("sink_properties=device.description={name}"),
+               "channel_map=mono"])
+        .output();
+    match st {
+        Ok(o) if o.status.success() => {
+            let id = String::from_utf8_lossy(&o.stdout);
+            eprintln!("[virtmic] created '{name}' (module {})", id.trim());
+        }
+        Ok(o) => eprintln!("[virtmic] load-module failed: {}", String::from_utf8_lossy(&o.stderr)),
+        Err(e) => eprintln!("[virtmic] pactl error: {e}"),
+    }
+}
+
+enum Output {
+    VirtMic(String), // feed a virtual source (default): no feedback loop
+    Monitor,         // play to default sink (headphones only!)
+    Target(String),  // feed a specific node by name
+    Wav(String),     // write gated audio to a .wav
+}
+
 // ---------- gate model ----------
 // Two Gaussian classes. Each stored as mean + precision (u8), scored on-chip.
 struct GateModel {
@@ -371,12 +444,34 @@ fn cmd_calibrate() {
     eprintln!("[calibrate] saved {GATE_PATH}. Run: sessiongate run");
 }
 
-fn cmd_run(target: Option<&str>) {
+fn cmd_run(out: Output) {
     let dsp = Dsp::new();
     let gmm = Gmm::open().expect("open /dev/gmm0");
     let model = GateModel::load(GATE_PATH).expect("load gate.txt (run calibrate first)");
+
+    // set up the chosen output sink
+    let mut spk: Option<Speaker> = None;
+    let mut wav: Option<WavOut> = None;
+    match &out {
+        Output::VirtMic(name) => {
+            ensure_virtmic(name);
+            eprintln!("[run] feeding virtual mic '{name}' - select it as your microphone in any app.");
+            spk = Some(Speaker::start(Some(name)));
+        }
+        Output::Target(name) => {
+            eprintln!("[run] feeding node '{name}'");
+            spk = Some(Speaker::start(Some(name)));
+        }
+        Output::Monitor => {
+            eprintln!("[run] MONITOR mode -> default speaker. USE HEADPHONES or it will howl!");
+            spk = Some(Speaker::start(None));
+        }
+        Output::Wav(path) => {
+            eprintln!("[run] writing gated audio to {path} (ctrl-c to stop, then play it back)");
+            wav = Some(WavOut::create(path));
+        }
+    }
     let mut mic = Mic::start();
-    let mut spk = Speaker::start(target);
 
     let mut ring: Vec<f32> = Vec::with_capacity(FRAME);
     let mut hop = [0f32; HOP];
@@ -388,12 +483,19 @@ fn cmd_run(target: Option<&str>) {
     eprintln!("[run] chip-gated passthrough. Speak -> open, silence/noise -> muted. (ctrl-c to stop)");
     eprintln!("[run] bias={}", model.bias);
 
+    macro_rules! emit {
+        ($buf:expr) => {{
+            if let Some(s) = spk.as_mut() { s.write_hop($buf); }
+            if let Some(w) = wav.as_mut() { w.write_hop($buf); }
+        }};
+    }
+
     while mic.read_hop(&mut hop) {
         ring.extend_from_slice(&hop);
         if ring.len() < FRAME {
             // not enough yet: pass silence
             let z = [0f32; HOP];
-            spk.write_hop(&z);
+            emit!(&z);
             continue;
         }
         let frame: Vec<f32> = ring[..FRAME].to_vec();
@@ -410,14 +512,14 @@ fn cmd_run(target: Option<&str>) {
 
         // output the newest HOP samples with a per-sample fade toward target
         let newest = &frame[FRAME - HOP..];
-        let mut out = [0f32; HOP];
+        let mut og = [0f32; HOP];
         let step = 1.0 / FADE_SAMPLES;
         for i in 0..HOP {
             if gain < target_gain { gain = (gain + step).min(target_gain); }
             else if gain > target_gain { gain = (gain - step).max(target_gain); }
-            out[i] = newest[i] * gain;
+            og[i] = newest[i] * gain;
         }
-        spk.write_hop(&out);
+        emit!(&og);
 
         frames += 1;
         if gate_open { open_frames += 1; }
@@ -430,6 +532,7 @@ fn cmd_run(target: Option<&str>) {
             eprintln!("  [{}s] gate open {:.0}%", frames / 125, 100.0 * open_frames as f32 / frames as f32);
         }
     }
+    if let Some(w) = wav { w.finish(); }
 }
 
 fn cmd_selftest() {
@@ -465,13 +568,27 @@ fn main() {
     match cmd {
         "calibrate" => cmd_calibrate(),
         "run" => {
-            // optional: sessiongate run --target <node>
-            let target = args.iter().position(|a| a == "--target").and_then(|i| args.get(i + 1)).map(|s| s.as_str());
-            cmd_run(target);
+            let get = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
+            let out = if args.iter().any(|a| a == "--monitor") {
+                Output::Monitor
+            } else if let Some(p) = get("--out") {
+                Output::Wav(p)
+            } else if let Some(t) = get("--target") {
+                Output::Target(t)
+            } else {
+                Output::VirtMic("SessionGate".to_string())
+            };
+            cmd_run(out);
+        }
+        "unload" => {
+            // remove the virtual mic
+            let _ = Command::new("pactl").args(["unload-module", "module-null-sink"]).status();
+            eprintln!("[unload] removed null-sink modules (SessionGate)");
         }
         "selftest" => cmd_selftest(),
         _ => {
-            eprintln!("usage: sessiongate <calibrate|run [--target NODE]|selftest>");
+            eprintln!("usage: sessiongate <calibrate | run [--monitor|--out FILE.wav|--target NODE] | unload | selftest>");
+            eprintln!("  run with no flag  -> feeds virtual mic 'SessionGate' (no feedback loop)");
             std::process::exit(2);
         }
     }
