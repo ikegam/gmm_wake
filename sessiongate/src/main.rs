@@ -499,7 +499,7 @@ fn cmd_calibrate() {
     // The noise Gaussian learns them, so later they score as noise, not speech.
     eprintln!("[calibrate] NON-SPEECH sample: DON'T talk. Make your usual noises -");
     eprintln!("[calibrate]   type, clap, eat chips, rustle, let the fan run, then go quiet.");
-    let (nz_frames, nz_e) = record_frames(&mut mic, &dsp, 6.0, "noise");
+    let (nz_frames, nz_e) = record_frames(&mut mic, &dsp, 10.0, "noise");
     let noise_floor = {
         let mut v = nz_e.clone();
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -509,7 +509,7 @@ fn cmd_calibrate() {
 
     // Phase 2: speech - keep talking.
     eprintln!("[calibrate] now KEEP TALKING (count, read a sentence) ...");
-    let (sp_all, sp_e) = record_frames(&mut mic, &dsp, 5.0, "speech");
+    let (sp_all, sp_e) = record_frames(&mut mic, &dsp, 10.0, "speech");
     // keep only frames clearly above the noise floor (actual voiced frames)
     let sp_thresh = noise_floor * 8.0;
     let sp_frames: Vec<[u8; NMEL]> = sp_all.iter().zip(sp_e.iter())
