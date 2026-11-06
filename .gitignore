@@ -17,3 +17,7 @@ Module.symvers
 
 # userspace test binary
 gmm_test
+
+# rust build + model
+sessionwake/target/
+sessionwake/model.txt
