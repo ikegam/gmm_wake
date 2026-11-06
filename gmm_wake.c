@@ -11,6 +11,8 @@
 #include <linux/seq_file.h>
 #include <linux/debugfs.h>
 #include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/fs.h>
 
 #define GMM_VENDOR 0x8086
 #define GMM_DEVICE 0x1911
@@ -21,7 +23,12 @@ struct gmm_dev {
 	void __iomem   *bar;
 	resource_size_t bar_len;
 	struct dentry  *dbg;
+	struct dentry  *dbg_poke;
+	char            result[320];
 };
+
+#define POKE_PAT_A 0xA5A5A5A5u
+#define POKE_PAT_B 0x5A5A5A5Au  /* bit-complement of A */
 
 static int gmm_regs_show(struct seq_file *s, void *unused)
 {
@@ -56,6 +63,80 @@ static int gmm_regs_show(struct seq_file *s, void *unused)
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(gmm_regs);
+
+/*
+ * poke: safe writability probe of a single dword register.
+ * Saves the original value, writes two bit-complement patterns, derives the
+ * writable-bit mask from their read-back XOR, then restores the original.
+ * Avoids all-ones / all-zeros writes to reduce the chance of triggering a
+ * control register. Still: only aim this at scratch-looking registers.
+ */
+static ssize_t gmm_poke_write(struct file *f, const char __user *ub,
+			      size_t len, loff_t *ppos)
+{
+	struct gmm_dev *d = f->private_data;
+	char kb[32];
+	u32 off, orig, ra, rb, rr, wmask;
+
+	if (!d || !d->bar)
+		return -ENODEV;
+	if (len == 0 || len >= sizeof(kb))
+		return -EINVAL;
+	if (copy_from_user(kb, ub, len))
+		return -EFAULT;
+	kb[len] = '\0';
+	if (kstrtou32(strim(kb), 0, &off))
+		return -EINVAL;
+	if ((off & 3) || off + 4 > d->bar_len)
+		return -EINVAL;
+
+	orig = ioread32(d->bar + off);
+	iowrite32(POKE_PAT_A, d->bar + off);
+	ra = ioread32(d->bar + off);
+	iowrite32(POKE_PAT_B, d->bar + off);
+	rb = ioread32(d->bar + off);
+	iowrite32(orig, d->bar + off);   /* restore */
+	rr = ioread32(d->bar + off);
+
+	wmask = ra ^ rb;                 /* bits that followed the two patterns */
+
+	scnprintf(d->result, sizeof(d->result),
+		"offset   : +0x%03x\n"
+		"original : 0x%08x\n"
+		"wrote A5A5A5A5 -> read 0x%08x\n"
+		"wrote 5A5A5A5A -> read 0x%08x\n"
+		"writable_mask : 0x%08x\n"
+		"restored : 0x%08x (%s)\n"
+		"verdict  : %s\n",
+		off, orig, ra, rb, wmask, rr,
+		rr == orig ? "OK" : "MISMATCH!",
+		wmask == 0xffffffffu ? "fully writable (scratch/RW)" :
+		wmask == 0 ? "read-only / ignored" :
+		"partially writable (some bits fixed)");
+
+	dev_info(&d->pdev->dev,
+		 "gmm_wake: poke +0x%03x orig=%08x A->%08x B->%08x wmask=%08x restored=%08x\n",
+		 off, orig, ra, rb, wmask, rr);
+	return len;
+}
+
+static ssize_t gmm_poke_read(struct file *f, char __user *ub,
+			     size_t len, loff_t *ppos)
+{
+	struct gmm_dev *d = f->private_data;
+	const char *msg = d->result[0] ? d->result :
+		"write a dword offset (e.g. 0x804) here to run a safe R/W probe\n";
+
+	return simple_read_from_buffer(ub, len, ppos, msg, strlen(msg));
+}
+
+static const struct file_operations gmm_poke_fops = {
+	.owner  = THIS_MODULE,
+	.open   = simple_open,
+	.read   = gmm_poke_read,
+	.write  = gmm_poke_write,
+	.llseek = default_llseek,
+};
 
 static int gmm_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
@@ -99,7 +180,9 @@ static int gmm_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		 (unsigned long long)d->bar_len, r0);
 
 	d->dbg = debugfs_create_file("gmm_wake", 0444, NULL, d, &gmm_regs_fops);
-	dev_info(&pdev->dev, "gmm_wake: register dump at /sys/kernel/debug/gmm_wake\n");
+	d->dbg_poke = debugfs_create_file("gmm_wake_poke", 0644, NULL, d,
+					  &gmm_poke_fops);
+	dev_info(&pdev->dev, "gmm_wake: dump at /sys/kernel/debug/gmm_wake, probe at /sys/kernel/debug/gmm_wake_poke\n");
 	return 0;
 
 err_release:
@@ -115,6 +198,7 @@ static void gmm_remove(struct pci_dev *pdev)
 
 	if (d) {
 		debugfs_remove(d->dbg);
+		debugfs_remove(d->dbg_poke);
 		if (d->bar)
 			pci_iounmap(pdev, d->bar);
 		pci_release_region(pdev, 0);
