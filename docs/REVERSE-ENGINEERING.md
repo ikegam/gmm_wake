@@ -72,6 +72,20 @@ acoustic-model scoring** and **noise reduction**. Only shipped sample
 `out = W·in + bias`, W 8×16 int16, in 16×4 int16, bias 8 int32, out 8×4 int32.
 Reference first output row: `-177 -85 29 28`. That matmul is our target job.
 
+## Empirical finding: 0x84 is a latching control register
+
+Writing `0x0` to `0x84` does NOT clear it (before=0x9, after=0x9). The value
+`0x9 = bit0|bit3` is exactly what our earlier sweep latched: `0xA5A5A5A5` set
+bit0, `0x5A5A5A5A` set bit3. So **0x84 is a write-1-to-set / latching control
+register, not scratch RAM** — strong evidence the GNA map (STS 0x80 / CTRL
+0x84) applies to this pre-0.9 part. bit0 (START candidate) is currently
+latched high, yet STS(0x80)=0 with no error — consistent with "START asserted
+but no valid descriptor/page-dir, so nothing executes."
+
+Consequence: the chip is now in a dirtied control state from the sweep. Do a
+**clean reboot before the real job attempt** so CTRL/STS start from power-on
+defaults. To clear without reboot, try the GNA ABORT path (CTRL bit2) or W1C.
+
 ## KEY MATCH: 0x200 == 64-entry page directory
 
 `GNA_PGDIRN_LEN = 64`. Our writable block `0x200-0x2fc` = 256 B = **64 × u32**,
