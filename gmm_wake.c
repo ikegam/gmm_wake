@@ -275,45 +275,40 @@ static int gmm_build(struct gmm_dev *d)
 	w32(cfg, C_SCRADD,  V_SCORE);
 	w32(cfg, C_SCRLEN,  4 * 1 * 1);
 
-	/* ---- MMU: one page table, one valid PTE -> data page ---- */
-	w32(d->pt_va, 0, (u32)(d->data_dma >> PAGE_SHIFT));
-
-	/* ---- descriptor MMU block: page directory + vamaxaddr ---- */
-	w32(d->desc_va, D_VAMAX, PAGE_SIZE - 1);
-	w32(d->desc_va, D_PGDIR, (u32)(d->pt_dma >> PAGE_SHIFT));
-	for (i = 1; i < GNA_PGDIRN_LEN; i++)
-		w32(d->desc_va, D_PGDIR + i * 4, GNA_PGDIR_INVALID);
-
-	/* ---- program DESBASE (PFN of the descriptor page) ---- */
-	iowrite32((u32)(d->desc_dma >> PAGE_SHIFT), d->bar + GNA_MMIO_DESBASE);
-
 	/*
-	 * pre-0.9 hypothesis: the page directory is consulted from BAR0 MMIO at
-	 * 0x200 (our confirmed 64-entry writable region), not from the RAM
-	 * descriptor. First fire gave VA_OOR, consistent with an empty BAR
-	 * page directory. Mirror it into BAR0 so virtual addresses resolve.
+	 * pre-0.9 model: GMM_CONFIG lives in BAR0 MMIO at 0x00 (its width fields
+	 * match the chip's power-on defaults there: fvwidth@0x08=1, mvwidth@0x20=1,
+	 * gcwidth@0x4c=4, scorewidth@0x58/0x74=4). The page directory at BAR0 0x200
+	 * is single-level: an entry is a data-page PFN directly. Copy our config
+	 * into BAR 0x00 and point pagedir[0] at the data page (GNA-virtual 0).
 	 */
-	iowrite32((u32)(d->pt_dma >> PAGE_SHIFT), d->bar + 0x200);  /* pagedir[0] -> page table */
+	for (i = 0; i < 128; i += 4)
+		iowrite32(*(u32 *)((u8 *)cfg + i), d->bar + i);  /* GMM_CONFIG -> BAR 0x00 */
+
+	iowrite32((u32)(d->data_dma >> PAGE_SHIFT), d->bar + 0x200);  /* VA 0 -> data page */
 	for (i = 1; i < GNA_PGDIRN_LEN; i++)
 		iowrite32(GNA_PGDIR_INVALID, d->bar + 0x200 + i * 4);
 
 	d->built = true;
 	scnprintf(d->run, sizeof(d->run),
-		"BUILT (not fired).\n"
-		"  desc  va=%p dma=%pad pfn=0x%llx\n"
-		"  pt    va=%p dma=%pad pfn=0x%llx\n"
-		"  data  va=%p dma=%pad pfn=0x%llx\n"
-		"  DESBASE(0xb0) <- 0x%llx\n"
+		"BUILT (not fired). GMM_CONFIG written to BAR0 0x00.\n"
+		"  data page pfn=0x%llx  pagedir[0]@BAR0x200 <- 0x%llx (single-level)\n"
 		"  GMM: vlen=%d numfv=1 mix=1 states=1, feature==mean, gconst=%d\n"
+		"  readback BAR config: fvaddr@00=0x%08x numfv@10=0x%08x vlen@14=0x%08x\n"
+		"    mvaddr@18=0x%08x gcaddr@44=0x%08x numgmms@64=0x%08x scradd@78=0x%08x\n"
+		"  pagedir[0]@BAR0x200 readback=0x%08x\n"
 		"  prediction: distance=0 -> score should relate to gconst(%d)\n"
-		"  write \"go\" to fire (hits CTRL START on undocumented silicon).\n",
-		d->desc_va, &d->desc_dma, (u64)(d->desc_dma >> PAGE_SHIFT),
-		d->pt_va, &d->pt_dma, (u64)(d->pt_dma >> PAGE_SHIFT),
-		d->data_va, &d->data_dma, (u64)(d->data_dma >> PAGE_SHIFT),
-		(u64)(d->desc_dma >> PAGE_SHIFT),
-		GMM_VLEN, GMM_GCONST, GMM_GCONST);
-	dev_info(&d->pdev->dev, "gmm_wake: GMM job BUILT, DESBASE=0x%llx\n",
-		 (u64)(d->desc_dma >> PAGE_SHIFT));
+		"  write \"go\" to fire.\n",
+		(u64)(d->data_dma >> PAGE_SHIFT),
+		(u64)(d->data_dma >> PAGE_SHIFT),
+		GMM_VLEN, GMM_GCONST,
+		ioread32(d->bar + C_FVADDR), ioread32(d->bar + C_NUMFV),
+		ioread32(d->bar + C_VLENGTH), ioread32(d->bar + C_MVADDR),
+		ioread32(d->bar + C_GCADDR), ioread32(d->bar + C_NUMGMMS),
+		ioread32(d->bar + C_SCRADD),
+		ioread32(d->bar + 0x200),
+		GMM_GCONST);
+	dev_info(&d->pdev->dev, "gmm_wake: GMM job BUILT (config in BAR0 0x00)\n");
 	return 0;
 }
 
