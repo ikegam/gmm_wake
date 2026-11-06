@@ -241,11 +241,19 @@ static int gmm_build(struct gmm_dev *d)
 	/* ---- data: feature == mean (so distance 0 -> score ~= gconst) ---- */
 	data = d->data_va;
 	for (i = 0; i < GMM_VLEN; i++) {
-		data[V_FEATURE + i] = 10 * (i + 1);  /* 10,20,...,80 */
-		data[V_MEAN    + i] = 10 * (i + 1);  /* identical     */
-		data[V_VAR     + i] = 1;             /* inverse covariance */
+		data[V_FEATURE + i] = 10 * (i + 1);
+		data[V_MEAN    + i] = 10 * (i + 1);
+		data[V_VAR     + i] = 1;
 	}
 	w32(data, V_GCONST, GMM_GCONST);
+	/*
+	 * NOTE: as of now the hardware writes exactly gconst to the score output
+	 * regardless of feature/mean/variance (verified: feature=100/mean=0/var=255
+	 * still yields gconst). The GMM op runs to completion (done=1) and the data
+	 * path works (gconst is read from mapped memory and the score is written
+	 * back; score tracks gconst 1000->1000, 4660->4660), but the
+	 * feature-dependent distance term is NOT yet being computed. Open problem.
+	 */
 	w32(data, V_SCORE, SCORE_SENTINEL);
 
 	/* ---- GMM_CONFIG (128 bytes) at descriptor offset 0x100 ---- */

@@ -5,7 +5,9 @@
 `gmm_wake` is a hand-written Linux kernel module that takes the Intel **Gaussian
 Mixture Model (GMM)** accelerator — PCI `8086:1911`, the Skylake-era (pre-0.9)
 ancestor of Intel GNA — from *disabled, no driver anywhere on Earth* to
-**running a real GMM scoring computation and writing back the correct result.**
+**running a GMM scoring operation to completion with a working data path** (it
+reads our mapped input and writes the score back). The feature-dependent
+distance arithmetic is **not yet working** — see *Honest status* below.
 
 Hardware: a Lenovo ThinkPad with an Intel Core i7-6600U (Skylake). The chip is a
 fixed-function, ultra-low-power accelerator originally built for always-on
@@ -20,23 +22,35 @@ OpenVINO GNA plugin was removed. So we wrote our own.
 
 ---
 
-## 🎉 Result
+## Honest status
+
+What is **proven to work**:
 
 ```
 FIRED.
-  STS 0x80 before=0x00000000 after=0x00000001
-  poll: settled after ~10 us
-  STS bits: done=0  (done=1)  err=0x0
-  score @data = 0x000003e8 (1000)   == gconst
-  -> OUTPUT CHANGED - hardware wrote the score!
+  STS 0x80 after=0x00000001   done=1  err=0x0   (~10 us)
+  score @data = 0x000003e8 (1000)  == gconst
 ```
 
-A minimal 1-state / 1-mixture / 8-element GMM, with the feature vector equal to
-the mean (distance 0), scores **exactly `gconst`**. Changing `gconst`
-(1000 → 4660) makes the hardware output track it exactly (1000 → 4660),
-proving the chip reads our input through the MMU we built and writes the
-computed score back. The chip takes ~10 µs of real compute time (versus the
-instant rejection of an invalid descriptor).
+- The chip is woken, accepts a GMM descriptor, runs the op to completion
+  (`done=1`, ~10 µs) with no error bits.
+- The **data path works**: the score output tracks `gconst` exactly
+  (gconst 1000 → score 1000, gconst 4660 → score 4660). So the chip reads our
+  input from mapped memory (through the MMU we built) and writes the output back.
+
+What does **NOT yet work**:
+
+- The **feature-dependent distance term**. With feature far from the mean
+  (feature=100, mean=0, variance=255) the score is *still* exactly `gconst`
+  (1000), not the `gconst + Σ var·(f−m)²` an L2 GMM score should give. So right
+  now the pipeline is effectively a **constant (`gconst`) passthrough**, not a
+  meaningful GMM computation. Why the distance accumulation is zero — a wrong
+  GMM_CONFIG field, the feature/mean not being read, or a score-output
+  semantics detail — is the open problem.
+
+In short: the hard infrastructure (wake, protocol, MMU, addressing, getting a
+clean `done=1`) is solved; the actual GMM math is not yet producing a
+feature-dependent result.
 
 ## How it works
 
@@ -86,8 +100,10 @@ build/go/poke cycle.
 - [x] Confirm the GNA register map (STS/CTRL/START) applies to pre-0.9 silicon
 - [x] Locate GMM_CONFIG in BAR0 `0x00` and the page directory in BAR0 `0x200`
 - [x] Discover `0x404` = the address-range limit (vamaxaddr)
-- [x] **Run a GMM scoring op to completion and read back the correct score**
-- [ ] Nail the feature-dependent distance term (currently gconst-dominated)
+- [x] Run a GMM scoring op to completion (`done=1`) with a working data path
+      (score tracks `gconst`)
+- [ ] **Make the feature-dependent distance term actually compute** (score is
+      currently a constant `gconst` passthrough)
 - [ ] Repurpose as a market-wave "wake-word" detector (see below)
 
 ## ⚠️ Warnings
@@ -135,20 +151,30 @@ OpenVINOのGNAプラグインも廃止済み。だから自分で書きました
 
 ---
 
-## 🎉 結果
+## 正直な現在地
+
+**できていること**:
 
 ```
 FIRED.
-  STS 0x80 before=0x00000000 after=0x00000001
-  done=1  err=0x0  (~10us)
+  STS 0x80 after=0x00000001  done=1  err=0x0  (~10us)
   score = 0x000003e8 (1000)  == gconst
-  -> ハードウェアがスコアを書いた!
 ```
 
-1状態・1混合・8要素の最小GMMで、特徴ベクトル=平均(距離0)にすると、スコアは
-**ちょうど `gconst`**。`gconst` を変える(1000→4660)と、ハードの出力もぴったり追従
-(1000→4660)——**我々が構築したMMU経由で入力を読み、計算したスコアを書き戻している**
-証拠です。有効な演算では約10µsの実計算時間がかかります(不正ディスクリプタの即時拒否と対照的)。
+- チップを起こし、GMMディスクリプタを受理、演算を完走(`done=1`, ~10µs、エラー無し)。
+- **データ経路は本物**:スコア出力が `gconst` にぴったり追従(gconst 1000→score 1000、
+  4660→4660)。= 我々が構築したMMU経由でマップ済みメモリから入力を読み、出力を書き戻している。
+
+**まだできていないこと**:
+
+- **特徴ベクトル依存の距離項**。feature を平均から大きく離しても(feature=100, mean=0,
+  variance=255)、スコアは**依然ちょうど `gconst`(1000)**で、L2 GMMスコアの
+  `gconst + Σ var·(f−m)²` にならない。つまり今は**定数(`gconst`)のパススルー**であって、
+  有意味なGMM計算ではない。距離の積算が0になる理由(GMM_CONFIGのフィールド誤り、
+  feature/meanが読まれていない、スコア出力の意味の取り違え)が未解決の課題。
+
+要するに:土台の難所(起動・プロトコル・MMU・アドレッシング・クリーンな `done=1`)は
+解けたが、**実際のGMM演算はまだ特徴依存の結果を出していない**。
 
 ## 仕組み
 
@@ -194,8 +220,8 @@ debugfs(`/sys/kernel/debug/gmm_wake*`):`gmm_wake`(レジスタダンプ)、`_run
 - [x] GNAレジスタ配置(STS/CTRL/START)がpre-0.9でも通用することを確認
 - [x] GMM_CONFIGがBAR0 `0x00`、ページディレクトリがBAR0 `0x200` にあると特定
 - [x] `0x404` = アドレス範囲上限(vamaxaddr)を発見
-- [x] **GMMスコアリング演算を完走させ、正しいスコアを読み戻す**
-- [ ] 特徴依存の距離項を詰める(現状gconst支配)
+- [x] GMM演算を完走(`done=1`)、データ経路が機能(スコアがgconstに追従)
+- [ ] **特徴依存の距離項を実際に計算させる**(現状は定数gconstのパススルー)
 - [ ] 相場の波の「ウェイクワード」検出器に転用(下記)
 
 ## ⚠️ 注意
