@@ -190,6 +190,7 @@ DEFINE_SHOW_ATTRIBUTE(gmm_gna);
 #define V_GCONST   0x0c0   /* 1 x s32  */
 #define V_SCORE    0x100   /* 1 x s32 (output) */
 
+#define VBASE      0x1000  /* data mapped at GNA-virtual 0x1000 (VA 0 is reserved) */
 #define GMM_VLEN   8       /* vector length (elements) */
 #define GMM_GCONST 1000    /* known Gaussian constant  */
 #define SCORE_SENTINEL 0xA5A5A5A5u
@@ -249,19 +250,19 @@ static int gmm_build(struct gmm_dev *d)
 
 	/* ---- GMM_CONFIG (128 bytes) at descriptor offset 0x100 ---- */
 	cfg = (u8 *)d->desc_va + D_CFG;
-	w32(cfg, C_FVADDR,  V_FEATURE);
+	w32(cfg, C_FVADDR,  VBASE + V_FEATURE);
 	w32(cfg, C_FVOFF,   round_up(GMM_VLEN * 1, 64));
 	w32(cfg, C_FVWIDTH, 1);
 	w32(cfg, C_MODE,    0);              /* L2, no read-elimination */
 	w32(cfg, C_NUMFV,   1);
 	w32(cfg, C_VLENGTH, GMM_VLEN);
-	w32(cfg, C_MVADDR,  V_MEAN);
+	w32(cfg, C_MVADDR,  VBASE + V_MEAN);
 	w32(cfg, C_MVWIDTH, 1);
 	w32(cfg, C_MVSOFF,  1 * GMM_VLEN * 1);
-	w32(cfg, C_VVADDR,  V_VAR);
+	w32(cfg, C_VVADDR,  VBASE + V_VAR);
 	w32(cfg, C_VVWIDTH, 1);
 	w32(cfg, C_VVSOFF,  1 * GMM_VLEN * 1);
-	w32(cfg, C_GCADDR,  V_GCONST);
+	w32(cfg, C_GCADDR,  VBASE + V_GCONST);
 	w32(cfg, C_GCWIDTH, 4);
 	w32(cfg, C_GCSOFF,  round_up(1, 2) * 4);
 	w32(cfg, C_MAXLS,   0x7fffffff);
@@ -272,7 +273,7 @@ static int gmm_build(struct gmm_dev *d)
 	w32(cfg, C_ASLADDR, 0);
 	w32(cfg, C_ASTLEN,  0);
 	w32(cfg, C_SCRWDTH, 4);
-	w32(cfg, C_SCRADD,  V_SCORE);
+	w32(cfg, C_SCRADD,  VBASE + V_SCORE);
 	w32(cfg, C_SCRLEN,  4 * 1 * 1);
 
 	/*
@@ -285,9 +286,26 @@ static int gmm_build(struct gmm_dev *d)
 	for (i = 0; i < 128; i += 4)
 		iowrite32(*(u32 *)((u8 *)cfg + i), d->bar + i);  /* GMM_CONFIG -> BAR 0x00 */
 
-	iowrite32((u32)(d->data_dma >> PAGE_SHIFT), d->bar + 0x200);  /* VA 0 -> data page */
+	/* 2-level MMU: pagedir[0] -> page table; pt[1] -> data (VA 0x1000, since
+	 * VA 0 is reserved). Provide it both in BAR0 0x200 and the RAM descriptor. */
+	w32(d->pt_va, 1 * 4, (u32)(d->data_dma >> PAGE_SHIFT));      /* pt[1] -> data page */
+
+	iowrite32((u32)(d->pt_dma >> PAGE_SHIFT), d->bar + 0x200);   /* BAR pagedir[0] */
 	for (i = 1; i < GNA_PGDIRN_LEN; i++)
 		iowrite32(GNA_PGDIR_INVALID, d->bar + 0x200 + i * 4);
+
+	w32(d->desc_va, D_VAMAX, 2 * PAGE_SIZE - 1);                 /* vamaxaddr = 0x1fff */
+	w32(d->desc_va, D_PGDIR, (u32)(d->pt_dma >> PAGE_SHIFT));    /* RAM pagedir[0] */
+	for (i = 1; i < GNA_PGDIRN_LEN; i++)
+		w32(d->desc_va, D_PGDIR + i * 4, GNA_PGDIR_INVALID);
+	iowrite32((u32)(d->desc_dma >> PAGE_SHIFT), d->bar + GNA_MMIO_DESBASE);
+
+	/*
+	 * DISCOVERED: BAR0 0x404 is this chip's address-range limit (the
+	 * vamaxaddr equivalent). Left at its small power-on default it rejects
+	 * every address with VA_OOR; opening it up lets scoring run.
+	 */
+	iowrite32(0x7fffffffu, d->bar + 0x404);
 
 	d->built = true;
 	scnprintf(d->run, sizeof(d->run),

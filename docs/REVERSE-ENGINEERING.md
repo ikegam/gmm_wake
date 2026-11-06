@@ -112,3 +112,39 @@ The win is making a driverless, undocumented 2016 chip perform a real
 computation under our own code. Expect dead-ends: Gen-0.9 register offsets
 and descriptor format may differ from Gen-2.0+, and some control bits may be
 unknowable without a logic-level trace.
+
+## SOLVED: first successful GMM computation
+
+The chip computes. Journey of the GO attempts (STS 0x80 after START):
+
+| Setup | STS err | meaning |
+|-------|---------|---------|
+| config in RAM descriptor, RAM MMU | `0x180` | VA_OOR + PARAM_OOR |
+| **config in BAR0 0x00** (correct params) | `0x080` | PARAM_OOR cleared; VA_OOR remains |
+| + various MMU / address schemes | `0x080` | VA_OOR stubborn |
+| **+ `0x404` = 0x7fffffff** | `0x000` | **done=1, score written** |
+
+**Key discoveries for the pre-0.9 Skylake GMM (`8086:1911`):**
+
+1. **GMM_CONFIG lives in BAR0 MMIO at `0x00`** (128 bytes), not in a RAM
+   descriptor. Confirmed: power-on width fields match GMM constants
+   (fvwidth@0x08=1, mvwidth@0x20=1, gcwidth@0x4c=4, score widths@0x58/0x74=4),
+   and our written config reads back and clears PARAM_OOR. STS/CTRL sit right
+   after it at 0x80/0x84.
+2. **`BAR0 0x404` is the address-range limit (vamaxaddr).** Its small power-on
+   default makes every descriptor address fail with VA_OOR. Writing a large
+   value lets scoring run. Found by probing the handful of writable scalar
+   registers (`0x0a0`, `0x404`).
+3. **Register map matches GNA:** STS `0x80` (bit0=done, bit7=VA_OOR,
+   bit8=PARAM_OOR), CTRL `0x84` (bit0=START, bits5-6=OP_MODE, bit2=abort),
+   DESBASE `0xB0`. CTRL is write-1-to-set/latching.
+4. **MMU:** 2-level page directory (BAR0 0x200 and/or RAM descriptor via
+   DESBASE), PTE = phys>>PAGE_SHIFT, data at virtual 0x1000 (virtual 0 reserved).
+
+**Verification:** feature==mean (distance 0) → score == gconst exactly;
+gconst 1000→score 1000, gconst 4660→score 4660. The chip reads our mapped input
+and writes the mapped output. ~10 µs compute time vs instant error rejection.
+
+**Open:** the feature-dependent distance term is still ~0 (score stays at
+gconst when the feature is perturbed) — the gconst-dominated minimal config, or
+a variance/stride encoding detail, still to be worked out.
