@@ -168,9 +168,16 @@ struct Mic {
     child: Child,
 }
 impl Mic {
-    fn start() -> Mic {
-        let child = Command::new("pw-record")
-            .args(["--rate=16000", "--channels=1", "--format=s16", "--raw", "-"])
+    // `target` pins a specific capture source (e.g. the real built-in mic) so
+    // we never accidentally record our own virtual mic and loop.
+    fn start(target: Option<&str>) -> Mic {
+        let mut cmd = Command::new("pw-record");
+        cmd.args(["--rate=16000", "--channels=1", "--format=s16", "--raw"]);
+        if let Some(t) = target {
+            cmd.arg("--target").arg(t);
+        }
+        cmd.arg("-");
+        let child = cmd
             .stdout(Stdio::piped())
             .spawn()
             .expect("failed to start pw-record (is pipewire installed?)");
@@ -278,31 +285,111 @@ impl WavOut {
     }
 }
 
-// Ensure a PipeWire virtual source exists so other apps can pick it as a mic.
-// Returns the module id (to optionally unload later). Idempotent.
-fn ensure_virtmic(name: &str) {
-    if let Ok(o) = Command::new("pactl").args(["list", "short", "modules"]).output() {
-        let s = String::from_utf8_lossy(&o.stdout);
-        if s.contains(&format!("sink_name={name}")) {
-            eprintln!("[virtmic] '{name}' already present");
-            return;
+// Ensure a PipeWire virtual mic exists. We create a PLAIN null-sink: that
+// gives a sink `<name>` (which we feed with pw-cat --target <name>) and a
+// monitor source `<name>.monitor` (which apps pick as their microphone).
+// This never touches the speakers. NOTE: do NOT use
+// media.class=Audio/Source/Virtual - that makes a source with no feedable
+// sink, so pw-cat --target falls back to the real speaker and howls.
+fn pactl_out(args: &[&str]) -> String {
+    Command::new("pactl").args(args).output().ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+}
+
+// Build a Chromium/Zoom-visible virtual microphone:
+//   null-sink `<name>`  (we feed this)  ->  monitor `<name>.monitor`
+//   remap-source `<name>Mic`            (a REAL source apps list as a mic)
+// Chromium hides monitor sources, so the remap-source is what makes it appear.
+// We snapshot and restore the default sink AND default source, so creating
+// these never steals the speakers' output or the app's real-mic capture.
+// Returns the real default source name to capture from (so we don't loop).
+fn ensure_virtmic(name: &str) -> Option<String> {
+    let mic = format!("{name}Mic");
+    let mods = pactl_out(&["list", "short", "modules"]);
+    let have_sink = mods.contains(&format!("sink_name={name}"));
+    let have_mic = mods.contains(&format!("source_name={mic}"));
+
+    // snapshot the real defaults BEFORE we add anything
+    let prev_sink = pactl_out(&["get-default-sink"]).trim().to_string();
+    let prev_source = pactl_out(&["get-default-source"]).trim().to_string();
+
+    if !have_sink {
+        let o = Command::new("pactl").args(["load-module", "module-null-sink",
+            &format!("sink_name={name}"),
+            &format!("sink_properties=device.description={name}"),
+            "channel_map=mono"]).output();
+        match o {
+            Ok(o) if o.status.success() => eprintln!("[virtmic] created sink '{name}' (module {})", String::from_utf8_lossy(&o.stdout).trim()),
+            Ok(o) => eprintln!("[virtmic] null-sink failed: {}", String::from_utf8_lossy(&o.stderr)),
+            Err(e) => eprintln!("[virtmic] pactl error: {e}"),
+        }
+    } else {
+        eprintln!("[virtmic] sink '{name}' already present");
+    }
+    if !have_mic {
+        let o = Command::new("pactl").args(["load-module", "module-remap-source",
+            &format!("master={name}.monitor"),
+            &format!("source_name={mic}"),
+            &format!("source_properties=device.description={mic}"),
+            "channels=1"]).output();
+        match o {
+            Ok(o) if o.status.success() => eprintln!("[virtmic] created mic source '{mic}' (module {})", String::from_utf8_lossy(&o.stdout).trim()),
+            Ok(o) => eprintln!("[virtmic] remap-source failed: {}", String::from_utf8_lossy(&o.stderr)),
+            Err(e) => eprintln!("[virtmic] pactl error: {e}"),
+        }
+    } else {
+        eprintln!("[virtmic] mic '{mic}' already present");
+    }
+
+    // restore defaults so YouTube keeps playing on the speakers and nothing
+    // else switches its mic to our virtual device
+    if !prev_sink.is_empty() && prev_sink != name {
+        let _ = Command::new("pactl").args(["set-default-sink", &prev_sink]).status();
+        eprintln!("[virtmic] kept default output = {prev_sink}");
+    }
+    if !prev_source.is_empty() && prev_source != mic {
+        let _ = Command::new("pactl").args(["set-default-source", &prev_source]).status();
+    }
+    eprintln!("[virtmic] >>> in Chromium/Zoom, pick the microphone named '{mic}' <<<");
+
+    // capture from the REAL mic explicitly (never the virtual one)
+    if prev_source.is_empty() || prev_source == mic { None } else { Some(prev_source) }
+}
+
+// Confirm OUR playback stream is attached to the virtual sink and not the
+// speaker, so we can never create a feedback loop. We identify our own stream
+// by its unique 16000 Hz / 1-channel format (other apps run at 48000/2ch), and
+// ignore every unrelated playback on the machine.
+fn verify_routing(name: &str) -> bool {
+    // index of our virtual sink, by name
+    let mut sink_idx = String::new();
+    if let Ok(sk) = Command::new("pactl").args(["list", "short", "sinks"]).output() {
+        for line in String::from_utf8_lossy(&sk.stdout).lines() {
+            let mut it = line.split_whitespace();
+            let idx = it.next().unwrap_or("");
+            let nm = it.next().unwrap_or("");
+            if nm == name { sink_idx = idx.to_string(); }
         }
     }
-    let st = Command::new("pactl")
-        .args(["load-module", "module-null-sink",
-               "media.class=Audio/Source/Virtual",
-               &format!("sink_name={name}"),
-               &format!("sink_properties=device.description={name}"),
-               "channel_map=mono"])
-        .output();
-    match st {
-        Ok(o) if o.status.success() => {
-            let id = String::from_utf8_lossy(&o.stdout);
-            eprintln!("[virtmic] created '{name}' (module {})", id.trim());
-        }
-        Ok(o) => eprintln!("[virtmic] load-module failed: {}", String::from_utf8_lossy(&o.stderr)),
-        Err(e) => eprintln!("[virtmic] pactl error: {e}"),
+    if sink_idx.is_empty() {
+        eprintln!("[virtmic] sink '{name}' not found");
+        return false;
     }
+    // our stream = the one at 16000 Hz
+    if let Ok(o) = Command::new("pactl").args(["list", "short", "sink-inputs"]).output() {
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            if !line.contains("16000Hz") { continue; }
+            let mut it = line.split_whitespace();
+            let _i = it.next();
+            let tgt = it.next().unwrap_or("");
+            if tgt == sink_idx { return true; }
+            eprintln!("[virtmic] WARNING: our stream is on sink {tgt}, not '{name}' (idx {sink_idx}).");
+            return false;
+        }
+    }
+    eprintln!("[virtmic] our playback stream not visible yet");
+    false
 }
 
 enum Output {
@@ -403,7 +490,7 @@ fn record_frames(mic: &mut Mic, dsp: &Dsp, secs: f32, label: &str) -> (Vec<[u8; 
 fn cmd_calibrate() {
     let dsp = Dsp::new();
     let gmm = Gmm::open().expect("open /dev/gmm0");
-    let mut mic = Mic::start();
+    let mut mic = Mic::start(None);
 
     // Phase 1: room noise - stay quiet.
     eprintln!("[calibrate] STAY QUIET for the noise sample ...");
@@ -458,10 +545,11 @@ fn cmd_run(out: Output) {
     // set up the chosen output sink
     let mut spk: Option<Speaker> = None;
     let mut wav: Option<WavOut> = None;
+    let mut mic_target: Option<String> = None; // explicit real-mic source
     match &out {
         Output::VirtMic(name) => {
-            ensure_virtmic(name);
-            eprintln!("[run] feeding virtual mic '{name}' - select it as your microphone in any app.");
+            mic_target = ensure_virtmic(name);
+            eprintln!("[run] feeding virtual mic '{name}' - select '{name}Mic' as your microphone.");
             spk = Some(Speaker::start(Some(name)));
         }
         Output::Target(name) => {
@@ -477,7 +565,26 @@ fn cmd_run(out: Output) {
             wav = Some(WavOut::create(path));
         }
     }
-    let mut mic = Mic::start();
+    let mut mic = Mic::start(mic_target.as_deref());
+
+    // Safety: before feeding real audio to a virtual mic, prime with silence
+    // and confirm our playback is on the virtual sink, not the speaker. If it
+    // isn't, abort - only silence will have been emitted, so no howl.
+    if let Output::VirtMic(name) = &out {
+        let z = [0f32; HOP];
+        let mut ok = false;
+        for _ in 0..6 {
+            if let Some(s) = spk.as_mut() { for _ in 0..8 { s.write_hop(&z); } }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            if verify_routing(name) { ok = true; break; }
+        }
+        if !ok {
+            eprintln!("[run] ABORT: output is not on virtual mic '{name}'. Refusing to risk a speaker feedback loop.");
+            eprintln!("[run] (only silence was emitted.) Check `pactl list short sinks` for '{name}'.");
+            return;
+        }
+        eprintln!("[run] routing verified: our stream feeds '{name}' only (no speaker). Safe.");
+    }
 
     let mut ring: Vec<f32> = Vec::with_capacity(FRAME);
     let mut hop = [0f32; HOP];
@@ -548,7 +655,7 @@ fn cmd_run(out: Output) {
 // Diagnostic: record the mic straight to a WAV with NO chip and NO gate, so we
 // can tell a capture-format problem from a gating problem.
 fn cmd_rec(path: &str, secs: f32) {
-    let mut mic = Mic::start();
+    let mut mic = Mic::start(None);
     let mut wav = WavOut::create(path);
     let mut hop = [0f32; HOP];
     let total = (secs * SR as f32 / HOP as f32) as u64;
@@ -688,9 +795,10 @@ fn main() {
             cmd_gatefile(inp, outp);
         }
         "unload" => {
-            // remove the virtual mic
+            // remove the virtual mic (remap-source first, then its null-sink)
+            let _ = Command::new("pactl").args(["unload-module", "module-remap-source"]).status();
             let _ = Command::new("pactl").args(["unload-module", "module-null-sink"]).status();
-            eprintln!("[unload] removed null-sink modules (SessionGate)");
+            eprintln!("[unload] removed SessionGate virtual mic (remap-source + null-sink)");
         }
         "selftest" => cmd_selftest(),
         _ => {
