@@ -330,10 +330,13 @@ fn ensure_virtmic(name: &str) -> Option<String> {
         eprintln!("[virtmic] sink '{name}' already present");
     }
     if !have_mic {
+        // device.class=sound (not the remap default "filter") is REQUIRED or
+        // Chromium/Chrome hides it from the mic picker. The literal double
+        // quotes protect the space so both properties land in the proplist.
         let o = Command::new("pactl").args(["load-module", "module-remap-source",
             &format!("master={name}.monitor"),
             &format!("source_name={mic}"),
-            &format!("source_properties=device.description={mic}"),
+            &format!("source_properties=\"device.description={mic} device.class=sound\""),
             "channels=1"]).output();
         match o {
             Ok(o) if o.status.success() => eprintln!("[virtmic] created mic source '{mic}' (module {})", String::from_utf8_lossy(&o.stdout).trim()),
