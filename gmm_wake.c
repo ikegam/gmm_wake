@@ -191,7 +191,7 @@ DEFINE_SHOW_ATTRIBUTE(gmm_gna);
 #define V_SCORE    0x100   /* 1 x s32 (output) */
 
 #define VBASE      0x1000  /* data mapped at GNA-virtual 0x1000 (VA 0 is reserved) */
-#define GMM_VLEN   8       /* vector length (elements) */
+#define GMM_VLEN   24      /* vector length; HW minimum is 24 (8 is reserved!) */
 #define GMM_GCONST 1000    /* known Gaussian constant  */
 #define SCORE_SENTINEL 0xA5A5A5A5u
 
@@ -241,9 +241,9 @@ static int gmm_build(struct gmm_dev *d)
 	/* ---- data: feature == mean (so distance 0 -> score ~= gconst) ---- */
 	data = d->data_va;
 	for (i = 0; i < GMM_VLEN; i++) {
-		data[V_FEATURE + i] = 10 * (i + 1);
-		data[V_MEAN    + i] = 10 * (i + 1);
-		data[V_VAR     + i] = 1;
+		data[V_FEATURE + i] = (u8)(7 * i + 3);   /* varied feature */
+		data[V_MEAN    + i] = (u8)(3 * i + 11);  /* varied mean    */
+		data[V_VAR     + i] = (u8)(1 + (i & 3)); /* varied variance */
 	}
 	w32(data, V_GCONST, GMM_GCONST);
 	/*
@@ -273,7 +273,7 @@ static int gmm_build(struct gmm_dev *d)
 	w32(cfg, C_GCADDR,  VBASE + V_GCONST);
 	w32(cfg, C_GCWIDTH, 4);
 	w32(cfg, C_GCSOFF,  round_up(1, 2) * 4);
-	w32(cfg, C_MAXLS,   0x7fffffff);
+	w32(cfg, C_MAXLS,   0xffffffff);   /* max score: avoid clamping the output */
 	w32(cfg, C_MAXLSW,  4);
 	w32(cfg, C_NUMMCPG, 1);             /* mixtures per GMM */
 	w32(cfg, C_GMMTELST, 1 * GMM_VLEN);
@@ -368,22 +368,36 @@ static int gmm_fire(struct gmm_dev *d)
 	rmb();
 	score = *(u32 *)((u8 *)d->data_va + V_SCORE);
 
-	scnprintf(d->run, sizeof(d->run),
-		"FIRED.\n"
-		"  STS 0x80 before=0x%08x after=0x%08x\n"
-		"  poll: %s after ~%d us%s\n"
-		"  STS bits: done=%u err=0x%x\n"
-		"  score @data+0x%03x = 0x%08x (%d)  [sentinel was 0x%08x]\n"
-		"  gconst=%d  -> %s\n",
-		sts_before, sts,
-		done ? "settled" : "TIMED OUT", i * 10,
-		done ? "" : " (STS never signalled)",
-		!!(sts & GNA_STS_DONE), (unsigned int)(sts & GNA_STS_ERRMASK),
-		V_SCORE, score, score, SCORE_SENTINEL,
-		GMM_GCONST,
-		score != SCORE_SENTINEL ?
-			"OUTPUT CHANGED - hardware wrote the score!" :
-			"output unchanged (chip did not write; offsets likely differ)");
+	/*
+	 * CPU reference of the exact GNA GMM kernel math, computed from the same
+	 * input buffer, to verify the hardware result:
+	 *   score = gconst + Sum_j var[j] * (feature[j] - mean[j])^2   (uint32)
+	 */
+	{
+		u8 *data = d->data_va;
+		u32 expected = GMM_GCONST;
+		int j;
+
+		for (j = 0; j < GMM_VLEN; j++) {
+			s16 diff = (s16)data[V_FEATURE + j] - (s16)data[V_MEAN + j];
+			u16 sq   = (u16)(diff * diff);
+			expected += (u32)sq * data[V_VAR + j];
+		}
+		scnprintf(d->run, sizeof(d->run),
+			"FIRED.\n"
+			"  STS 0x80 before=0x%08x after=0x%08x  done=%u err=0x%x (~%d us)\n"
+			"  HW score  = %u (0x%08x)\n"
+			"  CPU ref   = %u (= gconst %u + Sum var*(feat-mean)^2 over %d elems)\n"
+			"  VERDICT   : %s\n",
+			sts_before, sts,
+			!!(sts & GNA_STS_DONE), (unsigned int)(sts & GNA_STS_ERRMASK),
+			i * 10, score, score, expected, GMM_GCONST, GMM_VLEN,
+			(done && !(sts & GNA_STS_ERRMASK) && score == expected) ?
+				"PASS - hardware GMM result matches CPU reference" :
+				(score == SCORE_SENTINEL ?
+					"FAIL - hardware did not write the score" :
+					"MISMATCH - see values above"));
+	}
 	dev_info(&d->pdev->dev,
 		 "gmm_wake: FIRED sts %08x->%08x score=0x%08x done=%d\n",
 		 sts_before, sts, score, done);

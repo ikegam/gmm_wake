@@ -148,3 +148,26 @@ and writes the mapped output. ~10 µs compute time vs instant error rejection.
 **Open:** the feature-dependent distance term is still ~0 (score stays at
 gconst when the feature is perturbed) — the gconst-dominated minimal config, or
 a variance/stride encoding detail, still to be worked out.
+
+## SOLVED #2: real feature-dependent GMM computation
+
+The "score == gconst regardless of input" symptom was **`vlength=8`, an invalid
+value**. The GMM hardware's minimum vector length is 24; valid lengths are
+`{24,32,40,48,56,72,80,88,96}` (from the intel/gna library:
+`GMM_FV_ELEMENT_COUNT_MIN=24`, VLENGTH valid-value comment). With a reserved
+`vlength` the element loop runs zero times, so the chip emits `gconst` and never
+dereferences the feature/mean/variance pointers (matching: unmapped operands
+caused no fault).
+
+**Fix:** `vlength = 24` (pad vectors to 24 elements), `gmmtelst = nummcpg*vlength
+= 24`, `mvsoffset = vvsoffset = 24`, `maxlsscore = 0xffffffff` (avoid clamp).
+
+**Verified:** the module computes a CPU reference of the exact kernel math
+(`score = gconst + Σ_j var[j]*(feature[j]-mean[j])²`, uint32) and compares:
+
+```
+feature=100,mean=0,var=1  -> HW 241000 == CPU 241000  PASS
+varied feat/mean/var       -> HW 142760 == CPU 142760  PASS
+```
+
+Bit-exact across arbitrary data, in ~10 µs. This is genuine hardware GMM scoring.

@@ -5,9 +5,8 @@
 `gmm_wake` is a hand-written Linux kernel module that takes the Intel **Gaussian
 Mixture Model (GMM)** accelerator — PCI `8086:1911`, the Skylake-era (pre-0.9)
 ancestor of Intel GNA — from *disabled, no driver anywhere on Earth* to
-**running a GMM scoring operation to completion with a working data path** (it
-reads our mapped input and writes the score back). The feature-dependent
-distance arithmetic is **not yet working** — see *Honest status* below.
+**running a real GMM scoring computation whose result is verified, bit-exact,
+against a CPU reference.**
 
 Hardware: a Lenovo ThinkPad with an Intel Core i7-6600U (Skylake). The chip is a
 fixed-function, ultra-low-power accelerator originally built for always-on
@@ -22,35 +21,33 @@ OpenVINO GNA plugin was removed. So we wrote our own.
 
 ---
 
-## Honest status
+## Result — verified against a CPU reference
 
-What is **proven to work**:
+The module computes a CPU reference of the exact GMM kernel math from the same
+input buffer and compares it to what the hardware wrote:
 
 ```
 FIRED.
-  STS 0x80 after=0x00000001   done=1  err=0x0   (~10 us)
-  score @data = 0x000003e8 (1000)  == gconst
+  STS 0x80 after=0x00000001  done=1 err=0x0 (~10 us)
+  HW score  = 142760 (0x00022da8)
+  CPU ref   = 142760 (= gconst + Sum var*(feat-mean)^2 over 24 elems)
+  VERDICT   : PASS - hardware GMM result matches CPU reference
 ```
 
-- The chip is woken, accepts a GMM descriptor, runs the op to completion
-  (`done=1`, ~10 µs) with no error bits.
-- The **data path works**: the score output tracks `gconst` exactly
-  (gconst 1000 → score 1000, gconst 4660 → score 4660). So the chip reads our
-  input from mapped memory (through the MMU we built) and writes the output back.
+The score the hardware writes is **bit-exact** with
+`gconst + Σ_j var[j]·(feature[j] − mean[j])²` (unsigned 32-bit, the real GNA GMM
+formula), across arbitrary feature/mean/variance data. The accelerator reads all
+24 feature elements, 24 means and 24 variances through the MMU we built, does the
+squared-difference-times-variance accumulation, adds the per-mixture Gaussian
+constant, and writes the result — in ~10 µs. This is a genuine, feature-dependent
+computation, not a constant passthrough.
 
-What does **NOT yet work**:
-
-- The **feature-dependent distance term**. With feature far from the mean
-  (feature=100, mean=0, variance=255) the score is *still* exactly `gconst`
-  (1000), not the `gconst + Σ var·(f−m)²` an L2 GMM score should give. So right
-  now the pipeline is effectively a **constant (`gconst`) passthrough**, not a
-  meaningful GMM computation. Why the distance accumulation is zero — a wrong
-  GMM_CONFIG field, the feature/mean not being read, or a score-output
-  semantics detail — is the open problem.
-
-In short: the hard infrastructure (wake, protocol, MMU, addressing, getting a
-clean `done=1`) is solved; the actual GMM math is not yet producing a
-feature-dependent result.
+**The bug that hid it for a while:** the GMM hardware's minimum vector length is
+**24** (valid lengths `{24,32,40,48,56,72,80,88,96}`); `8` is a *reserved* value.
+With an invalid `vlength` the element loop runs zero times, so the chip emits
+exactly `gconst` and never reads the operands — which looked like success until
+we perturbed the inputs and nothing changed. Raising `vlength` to 24 turned on
+the real arithmetic.
 
 ## How it works
 
@@ -101,9 +98,8 @@ build/go/poke cycle.
 - [x] Locate GMM_CONFIG in BAR0 `0x00` and the page directory in BAR0 `0x200`
 - [x] Discover `0x404` = the address-range limit (vamaxaddr)
 - [x] Run a GMM scoring op to completion (`done=1`) with a working data path
-      (score tracks `gconst`)
-- [ ] **Make the feature-dependent distance term actually compute** (score is
-      currently a constant `gconst` passthrough)
+- [x] **Compute a real, feature-dependent GMM score, bit-exact vs a CPU
+      reference** (the fix: `vlength` must be ≥ 24; 8 is reserved)
 - [ ] Repurpose as a market-wave "wake-word" detector (see below)
 
 ## ⚠️ Warnings
@@ -151,30 +147,28 @@ OpenVINOのGNAプラグインも廃止済み。だから自分で書きました
 
 ---
 
-## 正直な現在地
+## 結果 — CPU参照とビット一致で検証
 
-**できていること**:
+モジュールは同じ入力バッファからGMMカーネルの式をCPUでも計算し、ハードの書いた値と突き合わせます:
 
 ```
 FIRED.
-  STS 0x80 after=0x00000001  done=1  err=0x0  (~10us)
-  score = 0x000003e8 (1000)  == gconst
+  STS 0x80 after=0x00000001  done=1 err=0x0 (~10us)
+  HW score  = 142760 (0x00022da8)
+  CPU ref   = 142760 (= gconst + Sum var*(feat-mean)^2 over 24 elems)
+  VERDICT   : PASS - hardware GMM result matches CPU reference
 ```
 
-- チップを起こし、GMMディスクリプタを受理、演算を完走(`done=1`, ~10µs、エラー無し)。
-- **データ経路は本物**:スコア出力が `gconst` にぴったり追従(gconst 1000→score 1000、
-  4660→4660)。= 我々が構築したMMU経由でマップ済みメモリから入力を読み、出力を書き戻している。
+ハードが書くスコアは、任意の feature/mean/variance に対して
+`gconst + Σ_j var[j]·(feature[j] − mean[j])²`(符号なし32bit、本物のGNA GMM式)と
+**ビット単位で一致**。アクセラレータは24要素の特徴・平均・分散をMMU経由で読み、
+二乗差×分散を積算し、混合ごとのガウス定数を足して、約10µsで結果を書く。
+**定数パススルーではない、本物の特徴依存演算。**
 
-**まだできていないこと**:
-
-- **特徴ベクトル依存の距離項**。feature を平均から大きく離しても(feature=100, mean=0,
-  variance=255)、スコアは**依然ちょうど `gconst`(1000)**で、L2 GMMスコアの
-  `gconst + Σ var·(f−m)²` にならない。つまり今は**定数(`gconst`)のパススルー**であって、
-  有意味なGMM計算ではない。距離の積算が0になる理由(GMM_CONFIGのフィールド誤り、
-  feature/meanが読まれていない、スコア出力の意味の取り違え)が未解決の課題。
-
-要するに:土台の難所(起動・プロトコル・MMU・アドレッシング・クリーンな `done=1`)は
-解けたが、**実際のGMM演算はまだ特徴依存の結果を出していない**。
+**しばらく隠れていたバグ**:GMMハードの最小ベクトル長は **24**(有効値
+`{24,32,40,48,56,72,80,88,96}`)で、`8` は*予約値*。無効な `vlength` だと要素ループが
+0回になり、チップはgconstちょうどを出力してオペランドを読まない——入力を揺らすまで
+成功に見えてしまった。`vlength` を24に上げて本物の演算が点火した。
 
 ## 仕組み
 
@@ -220,8 +214,8 @@ debugfs(`/sys/kernel/debug/gmm_wake*`):`gmm_wake`(レジスタダンプ)、`_run
 - [x] GNAレジスタ配置(STS/CTRL/START)がpre-0.9でも通用することを確認
 - [x] GMM_CONFIGがBAR0 `0x00`、ページディレクトリがBAR0 `0x200` にあると特定
 - [x] `0x404` = アドレス範囲上限(vamaxaddr)を発見
-- [x] GMM演算を完走(`done=1`)、データ経路が機能(スコアがgconstに追従)
-- [ ] **特徴依存の距離項を実際に計算させる**(現状は定数gconstのパススルー)
+- [x] GMM演算を完走(`done=1`)、データ経路が機能
+- [x] **特徴依存の本物のGMMスコアを計算、CPU参照とビット一致**(鍵:`vlength`≥24、8は予約値)
 - [ ] 相場の波の「ウェイクワード」検出器に転用(下記)
 
 ## ⚠️ 注意
