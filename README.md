@@ -86,7 +86,8 @@ contexts.
 - [x] Map BAR0 and read live registers
 - [x] Map the 4 KB register layout
 - [x] Confirm writable scratch registers (write/read-back test)
-- [ ] Map extent of the two scratch banks (0x800 / 0xc00) — next
+- [x] Map extent of the scratch banks; found ~288 B unique writable memory
+- [x] Settle 0x800/0xc00: ALIASED (one RAM, not two engines)
 - [ ] Reverse the scoring descriptor / command protocol — far future
 
 ### Writability probe result (offset 0x804)
@@ -121,10 +122,19 @@ Fully-writable ranges:
 | `0xc04..0xc34` | 20 B  | +4 field of 12-byte records, bank B (mirror)    |
 | `0x054,0x0a0,0x404` | 12 B | scattered writable dwords                   |
 
-**Usable "memory" on the chip: 308 bytes fully writable, of which one
-contiguous 256-byte block at `0x200`.** The scratch banks are laid out as
-12-byte records with the writable field at +4, duplicated at `0x800` and
-`0xc00` — consistent with two identical engine/queue contexts.
+The scratch banks are laid out as 12-byte records with the writable field
+at +4, appearing at both `0x800` and `0xc00`.
+
+### Bank aliasing result (hypothesis rejected)
+
+`0x804 vs 0xc04 : ALIASED (same RAM)`. The two scratch banks are **not two
+engines** — the `0xc00` window is a mirror of the same physical RAM as
+`0x800` (0x400-stride alias). The "two identical engine contexts" guess was
+wrong.
+
+**Usable memory on the chip: ~288 unique bytes** (the sweep's 308 B minus
+the 20 B `0xc00` alias of `0x800`), dominated by one contiguous 256-byte
+block at `0x200`. For scale: ~288 bytes ≈ 72 u32 values, or a short tweet.
 
 ## Safety
 
