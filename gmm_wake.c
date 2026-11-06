@@ -26,6 +26,7 @@ struct gmm_dev {
 	struct dentry  *dbg_poke;
 	struct dentry  *dbg_sweep;
 	struct dentry  *dbg_gna;
+	struct dentry  *dbg_wr;
 	char            result[320];
 	char            sweep[2048];
 };
@@ -203,6 +204,57 @@ static const struct file_operations gmm_poke_fops = {
 	.llseek = default_llseek,
 };
 
+/*
+ * Controlled single-dword write: echo "<off> <val>" (hex) to write <val> to
+ * BAR0+<off>. DANGEROUS by nature (writes real control registers). Reads back
+ * and reports before/after. Used to clear stray state and to drive the GO
+ * experiment once the descriptor format is known.
+ */
+static ssize_t gmm_wr_write(struct file *f, const char __user *ub,
+			    size_t len, loff_t *ppos)
+{
+	struct gmm_dev *d = f->private_data;
+	char kb[48], *p, *tok;
+	u32 off, val, before, after;
+
+	if (!d || !d->bar)
+		return -ENODEV;
+	if (len == 0 || len >= sizeof(kb))
+		return -EINVAL;
+	if (copy_from_user(kb, ub, len))
+		return -EFAULT;
+	kb[len] = '\0';
+	p = strim(kb);
+
+	tok = strsep(&p, " \t");
+	if (!tok || !p || kstrtou32(tok, 0, &off))
+		return -EINVAL;
+	if (kstrtou32(strim(p), 0, &val))
+		return -EINVAL;
+	if ((off & 3) || off + 4 > d->bar_len)
+		return -EINVAL;
+
+	before = ioread32(d->bar + off);
+	iowrite32(val, d->bar + off);
+	after = ioread32(d->bar + off);
+
+	scnprintf(d->result, sizeof(d->result),
+		"wrote 0x%08x to +0x%03x : before=0x%08x after=0x%08x %s\n",
+		val, off, before, after,
+		after == val ? "(took)" : "(HW modified / sticky bits)");
+	dev_info(&d->pdev->dev, "gmm_wake: wr +0x%03x <= 0x%08x (before %08x after %08x)\n",
+		 off, val, before, after);
+	return len;
+}
+
+static const struct file_operations gmm_wr_fops = {
+	.owner  = THIS_MODULE,
+	.open   = simple_open,
+	.read   = gmm_poke_read,   /* reuse: reports d->result */
+	.write  = gmm_wr_write,
+	.llseek = default_llseek,
+};
+
 /* Probe one dword's writable-bit mask, restoring the original value. */
 static u32 gmm_probe_dword(struct gmm_dev *d, resource_size_t off)
 {
@@ -369,6 +421,8 @@ static int gmm_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 					   &gmm_sweep_fops);
 	d->dbg_gna = debugfs_create_file("gmm_wake_gna", 0444, NULL, d,
 					 &gmm_gna_fops);
+	d->dbg_wr = debugfs_create_file("gmm_wake_wr", 0644, NULL, d,
+					&gmm_wr_fops);
 	dev_info(&pdev->dev, "gmm_wake: dump=/sys/kernel/debug/gmm_wake poke=..._poke sweep=..._sweep\n");
 	return 0;
 
@@ -388,6 +442,7 @@ static void gmm_remove(struct pci_dev *pdev)
 		debugfs_remove(d->dbg_poke);
 		debugfs_remove(d->dbg_sweep);
 		debugfs_remove(d->dbg_gna);
+		debugfs_remove(d->dbg_wr);
 		if (d->bar)
 			pci_iounmap(pdev, d->bar);
 		pci_release_region(pdev, 0);
