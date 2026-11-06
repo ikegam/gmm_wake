@@ -85,8 +85,23 @@ contexts.
 - [x] Power the chip on (`enable 0→1`, `power_state=D0`)
 - [x] Map BAR0 and read live registers
 - [x] Map the 4 KB register layout
-- [ ] Confirm writable scratch registers (write/read-back test) — next
+- [x] Confirm writable scratch registers (write/read-back test)
+- [ ] Map extent of the two scratch banks (0x800 / 0xc00) — next
 - [ ] Reverse the scoring descriptor / command protocol — far future
+
+### Writability probe result (offset 0x804)
+
+```
+original : 0x76543210
+wrote A5A5A5A5 -> read 0xa5a5a5a5
+wrote 5A5A5A5A -> read 0x5a5a5a5a
+writable_mask : 0xffffffff   (fully writable, scratch/RW)
+restored : 0x76543210 (OK)
+```
+
+Bidirectional control confirmed: we can read *and* write the chip's
+registers, and restore state cleanly. The `0x76543210`-filled banks at
+`0x800` and `0xc00` behave as writable scratch/descriptor RAM.
 
 ## Safety
 
