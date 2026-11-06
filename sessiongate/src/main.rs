@@ -260,15 +260,21 @@ impl WavOut {
         }
         self.n += HOP as u64;
     }
-    fn finish(mut self) {
-        use std::io::Seek;
+    // Patch the RIFF/data sizes in place and flush, so the file is a valid,
+    // playable WAV at any moment - even if the process is killed by Ctrl-C
+    // before finish() runs. Called periodically and at the end.
+    fn checkpoint(&mut self) {
+        use std::io::{Seek, SeekFrom};
         let data_len = (self.n * 2) as u32;
-        self.f.flush().unwrap();
-        let mut inner = self.f.into_inner().unwrap();
-        inner.seek(std::io::SeekFrom::Start(4)).unwrap();
-        inner.write_all(&(36 + data_len).to_le_bytes()).unwrap();
-        inner.seek(std::io::SeekFrom::Start(40)).unwrap();
-        inner.write_all(&data_len.to_le_bytes()).unwrap();
+        let _ = self.f.seek(SeekFrom::Start(4));
+        let _ = self.f.write_all(&(36 + data_len).to_le_bytes());
+        let _ = self.f.seek(SeekFrom::Start(40));
+        let _ = self.f.write_all(&data_len.to_le_bytes());
+        let _ = self.f.seek(SeekFrom::End(0));
+        let _ = self.f.flush();
+    }
+    fn finish(mut self) {
+        self.checkpoint();
     }
 }
 
@@ -531,8 +537,100 @@ fn cmd_run(out: Output) {
         if frames % 625 == 0 {
             eprintln!("  [{}s] gate open {:.0}%", frames / 125, 100.0 * open_frames as f32 / frames as f32);
         }
+        // keep the wav header valid every ~0.5s so Ctrl-C never leaves it empty
+        if frames % 62 == 0 {
+            if let Some(w) = wav.as_mut() { w.checkpoint(); }
+        }
     }
     if let Some(w) = wav { w.finish(); }
+}
+
+// Diagnostic: record the mic straight to a WAV with NO chip and NO gate, so we
+// can tell a capture-format problem from a gating problem.
+fn cmd_rec(path: &str, secs: f32) {
+    let mut mic = Mic::start();
+    let mut wav = WavOut::create(path);
+    let mut hop = [0f32; HOP];
+    let total = (secs * SR as f32 / HOP as f32) as u64;
+    let mut n = 0u64;
+    let mut peak = 0f32;
+    eprintln!("[rec] passthrough capture -> {path} for {secs:.0}s (talk now)");
+    while n < total && mic.read_hop(&mut hop) {
+        for s in hop.iter() { peak = peak.max(s.abs()); }
+        wav.write_hop(&hop);
+        n += 1;
+        if n % 62 == 0 { wav.checkpoint(); }
+    }
+    wav.finish();
+    eprintln!("[rec] wrote {} frames (~{:.1}s), peak level {:.3} (want ~0.1-0.9)",
+        n, n as f32 * HOP as f32 / SR as f32, peak);
+    eprintln!("[rec] play it: mplayer {path}  (should sound like a clean normal recording)");
+}
+
+// read a 16k mono s16 WAV into f32 samples (parses the data chunk)
+fn read_wav(path: &str) -> Vec<f32> {
+    let mut bytes = Vec::new();
+    File::open(path).expect("open wav").read_to_end(&mut bytes).unwrap();
+    // find "data" chunk
+    let mut i = 12;
+    let mut data = &bytes[..0];
+    while i + 8 <= bytes.len() {
+        let id = &bytes[i..i + 4];
+        let sz = u32::from_le_bytes([bytes[i+4], bytes[i+5], bytes[i+6], bytes[i+7]]) as usize;
+        if id == b"data" {
+            let end = (i + 8 + sz).min(bytes.len());
+            data = &bytes[i + 8..end];
+            break;
+        }
+        i += 8 + sz + (sz & 1);
+    }
+    let mut out = Vec::with_capacity(data.len() / 2);
+    for c in data.chunks_exact(2) {
+        out.push(i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0);
+    }
+    out
+}
+
+// Offline: apply the gate model to in.wav, write gated out.wav, print stats.
+// Lets us iterate bias on one fixed recording without re-recording.
+fn cmd_gatefile(inp: &str, outp: &str) {
+    let dsp = Dsp::new();
+    let gmm = Gmm::open().expect("open /dev/gmm0");
+    let model = GateModel::load(GATE_PATH).expect("load gate.txt (run calibrate first)");
+    let samples = read_wav(inp);
+    if samples.is_empty() { eprintln!("[gatefile] no samples in {inp}"); std::process::exit(1); }
+
+    let mut wav = WavOut::create(outp);
+    let mut gain = 0f32;
+    let mut hold: i32 = 0;
+    let (mut frames, mut open_frames) = (0u64, 0u64);
+    let step = 1.0 / FADE_SAMPLES;
+    let mut pos = 0usize;
+    while pos + FRAME <= samples.len() {
+        let frame = &samples[pos..pos + FRAME];
+        let qf = quantize(&dsp.feat(frame));
+        let ss = gmm.score(&qf, &model.sp_mean, &model.sp_var) as i32;
+        let ns = gmm.score(&qf, &model.nz_mean, &model.nz_var) as i32;
+        let is_speech = ss + model.bias < ns;
+        if is_speech { hold = HANG_FRAMES; } else if hold > 0 { hold -= 1; }
+        let gate_open = hold > 0;
+        let target_gain = if gate_open { 1.0 } else { 0.0 };
+        let newest = &frame[FRAME - HOP..];
+        let mut og = [0f32; HOP];
+        for i in 0..HOP {
+            if gain < target_gain { gain = (gain + step).min(target_gain); }
+            else if gain > target_gain { gain = (gain - step).max(target_gain); }
+            og[i] = newest[i] * gain;
+        }
+        wav.write_hop(&og);
+        frames += 1;
+        if gate_open { open_frames += 1; }
+        pos += HOP;
+    }
+    wav.finish();
+    eprintln!("[gatefile] {} frames, gate open {:.0}%  (bias={})",
+        frames, 100.0 * open_frames as f32 / frames.max(1) as f32, model.bias);
+    eprintln!("[gatefile] wrote {outp} - compare: aplay {inp} ; aplay {outp}");
 }
 
 fn cmd_selftest() {
@@ -579,6 +677,15 @@ fn main() {
                 Output::VirtMic("SessionGate".to_string())
             };
             cmd_run(out);
+        }
+        "rec" => {
+            let path = args.get(2).map(|s| s.as_str()).unwrap_or("/tmp/rec.wav");
+            cmd_rec(path, 6.0);
+        }
+        "gatefile" => {
+            let inp = args.get(2).map(|s| s.as_str()).unwrap_or("/tmp/truth.wav");
+            let outp = args.get(3).map(|s| s.as_str()).unwrap_or("/tmp/gated.wav");
+            cmd_gatefile(inp, outp);
         }
         "unload" => {
             // remove the virtual mic
