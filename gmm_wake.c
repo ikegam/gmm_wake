@@ -278,6 +278,16 @@ static int gmm_build(struct gmm_dev *d)
 	/* ---- program DESBASE (PFN of the descriptor page) ---- */
 	iowrite32((u32)(d->desc_dma >> PAGE_SHIFT), d->bar + GNA_MMIO_DESBASE);
 
+	/*
+	 * pre-0.9 hypothesis: the page directory is consulted from BAR0 MMIO at
+	 * 0x200 (our confirmed 64-entry writable region), not from the RAM
+	 * descriptor. First fire gave VA_OOR, consistent with an empty BAR
+	 * page directory. Mirror it into BAR0 so virtual addresses resolve.
+	 */
+	iowrite32((u32)(d->pt_dma >> PAGE_SHIFT), d->bar + 0x200);  /* pagedir[0] -> page table */
+	for (i = 1; i < GNA_PGDIRN_LEN; i++)
+		iowrite32(GNA_PGDIR_INVALID, d->bar + 0x200 + i * 4);
+
 	d->built = true;
 	scnprintf(d->run, sizeof(d->run),
 		"BUILT (not fired).\n"
