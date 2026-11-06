@@ -24,6 +24,8 @@ const NBINS: usize = FRAME / 2; // 128 magnitude bins (0..8 kHz)
 const NMEL: usize = 24;       // feature dim == GMM vlen
 const ENROLL_N: usize = 6;    // utterances to enroll
 const MODEL_PATH: &str = "model.txt";
+const MIN_FRAMES: usize = 12;  // ~96 ms  (loosened so short "session" is kept)
+const MAX_FRAMES: usize = 220; // ~1.76 s
 
 // ---------- /dev/gmm0 ioctl ----------
 #[repr(C)]
@@ -233,11 +235,17 @@ impl Segmenter {
         self.ring.drain(..HOP);
 
         let energy: f32 = frame.iter().map(|x| x * x).sum::<f32>() / FRAME as f32;
-        // adapt noise floor slowly when not voiced
+        // Track the noise floor toward the quietest recent level: fall fast,
+        // rise very slowly, so speech energy never drags the floor up and
+        // starves later utterances. Only adapt while not inside a segment.
         if !self.voiced {
-            self.noise = 0.995 * self.noise + 0.005 * energy;
+            if energy < self.noise {
+                self.noise = 0.9 * self.noise + 0.1 * energy;   // down fast
+            } else {
+                self.noise = 0.9995 * self.noise + 0.0005 * energy; // up slow
+            }
         }
-        let thresh = (self.noise * 8.0).max(3e-4);
+        let thresh = (self.noise * 6.0).max(2e-4);
         let is_voice = energy > thresh;
 
         let feat = self.dsp.feat(&frame);
@@ -260,17 +268,18 @@ impl Segmenter {
                 // end of segment (~96 ms of silence)
                 self.voiced = false;
                 let dur_ms = self.nframes * HOP * 1000 / SR;
-                if self.nframes >= 18 && self.nframes <= 180 {
+                if self.nframes >= MIN_FRAMES && self.nframes <= MAX_FRAMES {
                     let mut mean = [0f32; NMEL];
                     for i in 0..NMEL {
                         mean[i] = self.acc[i] / self.nframes as f32;
                     }
                     if debug {
-                        eprintln!("segment: {} frames (~{} ms)", self.nframes, dur_ms);
+                        eprintln!("segment OK: {} frames (~{} ms)", self.nframes, dur_ms);
                     }
                     emit = Some(quantize(&mean));
                 } else if debug {
-                    eprintln!("segment rejected: {} frames (~{} ms)", self.nframes, dur_ms);
+                    let why = if self.nframes < MIN_FRAMES { "too short" } else { "too long" };
+                    eprintln!("segment rejected ({}): {} frames (~{} ms)", why, self.nframes, dur_ms);
                 }
             }
         }
@@ -375,7 +384,7 @@ fn cmd_enroll() {
     let mut samples: Vec<[u8; NMEL]> = Vec::new();
     eprintln!("[enroll] say \"session\" clearly, {ENROLL_N} times. Pause between.");
     while mic.read_hop(&mut hop) {
-        if let Some(f) = seg.push_hop(&hop, false) {
+        if let Some(f) = seg.push_hop(&hop, true) {
             samples.push(f);
             eprintln!("  captured {}/{}", samples.len(), ENROLL_N);
             if samples.len() >= ENROLL_N {
@@ -400,8 +409,11 @@ fn cmd_enroll() {
     // threshold from enrollment self-scores
     let mut model = Model { mean, var, gconst: 0, threshold: u32::MAX };
     let scores: Vec<u32> = samples.iter().map(|s| gmm.score(s, &model.mean, &model.var, 0)).collect();
+    // Live utterances score 2-4x higher than enrollment self-scores (room,
+    // distance, intonation vary), while non-"session" sounds land ~10x higher
+    // still, so a generous multiple keeps recall without risking false fires.
     let maxs = *scores.iter().max().unwrap();
-    model.threshold = ((maxs as f32) * 1.8) as u32 + 1;
+    model.threshold = ((maxs as f32) * 6.0) as u32 + 1;
     eprintln!("[enroll] self-scores: {:?}", scores);
     eprintln!("[enroll] threshold set to {}", model.threshold);
     model.save(MODEL_PATH).expect("save model");
