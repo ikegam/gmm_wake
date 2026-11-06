@@ -17,15 +17,69 @@ until checked against the GNA reference source.
 | `0x804..0x834`/`0xc04..0xc34` | 12-byte records, writable field at +4; `0xc00` ALIASES `0x800` | **Control/queue descriptor** for one request context (two address windows, one RAM) |
 | scattered `0x054,0x0a0,0x404` | writable dwords                    | candidate CONTROL / STATUS / doorbell registers                  |
 
-## What we need from the GNA reference (being gathered)
+## GNA reference spec (obtained)
 
-- [ ] A. BAR0 register map: CONTROL (+ "go" bit), STATUS (busy/done/error),
-      descriptor/page-directory base register, interrupt mask. Numeric offsets.
-- [ ] B. Descriptor (xNN / operation) struct layout, field by field.
-- [ ] C. Submission sequence: register write order, kick-off, completion.
-- [ ] D. Generation differences; PCI id list (confirm 0x1911 absent).
-- [ ] E. Sample workloads: what Intel's own `samples/` actually run
-      (GMM scoring / speech acoustic scoring / affine+activation layers).
+From the mainline-proposed `drivers/misc/intel/gna/` (lore.kernel.org v5,
+2022-10-20) and the archived `github.com/intel/gna` userspace library.
+
+### A. BAR0 register map (GNA Gen 0.9-3.0; UNVERIFIED for pre-0.9 1911)
+
+| Off  | Name    | Meaning                                                        |
+|------|---------|----------------------------------------------------------------|
+| 0x80 | STS     | bit0=done, b3=stats_valid, b4=MMU_err, b5=DMA_err, b7=VA_OOR, b8=PARAM_OOR, b17=saturate |
+| 0x84 | CTRL    | **bit0=START_ACCEL (GO)**, b1=active_list_en, b2=abort, **b5-6=OP_MODE (0=GMM,1=XNN)**, b8=comp_int_en, b10=err_int_en, b12-15=perf |
+| 0x8c | PTC     | perf total cycles                                              |
+| 0x90 | PSC     | perf stall cycles                                              |
+| 0xa8 | D0I3C   | D0i3 power control                                             |
+| 0xb0 | DESBASE | **PFN of the 784-byte hw descriptor**                          |
+| 0xb4 | IBUFFS  | input buffer size                                              |
+
+Single MSI vector; no separate IRQ-mask register (IRQs enabled by CTRL bits).
+
+### B. Descriptor (784 bytes, pointed to by DESBASE PFN)
+
+- `+256 xnn_config`: `u32 labase` (layer-array GNA-virtual addr), `u16 lacount`.
+- `+512 gna_mmu`: `u32 vamaxaddr`, then **`u32 pagedir_n[64]`** — a 64-entry
+  page directory; each entry → a page table of up to 1024 u32 page addresses.
+  Two-level MMU, 64 page tables, max 256 MB mapped.
+- Per-layer op descriptors live in GNA-mapped memory at `labase`; their binary
+  format is opaque (emitted by the userspace library, not in the kernel).
+
+### C. Submission sequence
+
+1. Pin/map buffers; apply pointer patches; fill page tables (`gna_mmu_add`).
+2. Build descriptor: set `xnn_config.labase/lacount` (XNN) or copy GMM config.
+3. `DESBASE = hwdesc_dma >> PAGE_SHIFT`.
+4. `CTRL`: set START_ACCEL(b0) | COMP_INT_EN(b8) | ERR_INT_EN(b10) | OP_MODE |
+   perf/active-list bits, then write CTRL. **Writing bit0 is the GO.**
+5. Wait for completion interrupt (ISR reads STS, clears busy).
+6. Read STS: error bits → -EIO; bit0 set → done; else -ENODATA.
+7. Abort: set CTRL b2, poll STS bit0 clear.
+
+### D. Generations / PCI IDs
+
+Kernel binds: GLK 0x3190, CNL 0x5A11, EHL 0x4511, ICL 0x8A11 (Gen1);
+JSL 0x4E11, TGL 0x9A11, RKL 0x4C11, ADL 0x464F, RPL 0xA74F (Gen2).
+**0x1911 is NOT bound by any kernel driver.** Userspace lib enum:
+`Gna2DeviceVersionGMM = 0x01` (our chip) predates `0_9=0x09`. GEN1 caps:
+max_layer_count=1024, num_pagetables=64, max_hw_mem=256MB.
+
+### E. Use case / hello-world
+
+GNA = low-power neural coprocessor; OpenVINO GNA plugin used it for **speech
+acoustic-model scoring** and **noise reduction**. Only shipped sample
+(`samples/src/sample01/sample01.cpp`) = **one FullyConnectedAffine layer**:
+`out = W·in + bias`, W 8×16 int16, in 16×4 int16, bias 8 int32, out 8×4 int32.
+Reference first output row: `-177 -85 29 28`. That matmul is our target job.
+
+## KEY MATCH: 0x200 == 64-entry page directory
+
+`GNA_PGDIRN_LEN = 64`. Our writable block `0x200-0x2fc` = 256 B = **64 × u32**,
+default all-`0xffffffff` (empty). This strongly supports: **the pre-0.9 GMM
+keeps its page directory in BAR0 MMIO** (vs GNA 0.9+ which keeps it in the RAM
+descriptor). The `0x800`/`0xc00` 12-byte records may be the in-BAR
+xnn/layer descriptor. Control/status likely live in `0x00-0x08c` (our dense
+low block), NOT at GNA's 0x80/0x84 — those read 0 on our chip.
 
 ## Plan once the reference lands
 

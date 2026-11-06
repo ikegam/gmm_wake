@@ -25,6 +25,7 @@ struct gmm_dev {
 	struct dentry  *dbg;
 	struct dentry  *dbg_poke;
 	struct dentry  *dbg_sweep;
+	struct dentry  *dbg_gna;
 	char            result[320];
 	char            sweep[2048];
 };
@@ -65,6 +66,68 @@ static int gmm_regs_show(struct seq_file *s, void *unused)
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(gmm_regs);
+
+/* GNA Gen0.9+ register offsets (from the mainline-proposed intel_gna driver). */
+#define GNA_MMIO_STS     0x80
+#define GNA_MMIO_CTRL    0x84
+#define GNA_MMIO_PTC     0x8c
+#define GNA_MMIO_PSC     0x90
+#define GNA_MMIO_D0I3C   0xa8
+#define GNA_MMIO_DESBASE 0xb0
+#define GNA_MMIO_IBUFFS  0xb4
+#define GNA_PGDIR_OFF    0x200   /* our hypothesis: 64-entry page directory */
+#define GNA_PGDIR_N      64
+
+/*
+ * Read-only interpretation of BAR0 through the GNA register map. These
+ * offsets are confirmed for GNA Gen 0.9-3.0 (Gemini Lake onward); for the
+ * pre-0.9 Skylake GMM (8086:1911) they are a HYPOTHESIS to be verified.
+ */
+static int gmm_gna_show(struct seq_file *s, void *unused)
+{
+	struct gmm_dev *d = s->private;
+	u32 sts, ctrl, desbase, ibuffs;
+	int i, valid = 0;
+
+	if (!d || !d->bar) {
+		seq_puts(s, "no BAR mapped\n");
+		return 0;
+	}
+	sts     = ioread32(d->bar + GNA_MMIO_STS);
+	ctrl    = ioread32(d->bar + GNA_MMIO_CTRL);
+	desbase = ioread32(d->bar + GNA_MMIO_DESBASE);
+	ibuffs  = ioread32(d->bar + GNA_MMIO_IBUFFS);
+
+	seq_puts(s, "BAR0 via GNA register map (offsets UNVERIFIED for pre-0.9 1911)\n\n");
+	seq_printf(s, "STS     0x80 = 0x%08x  [done=%u stats=%u mmu_err=%u dma_err=%u va_oor=%u param_oor=%u]\n",
+		   sts, !!(sts & BIT(0)), !!(sts & BIT(3)), !!(sts & BIT(4)),
+		   !!(sts & BIT(5)), !!(sts & BIT(7)), !!(sts & BIT(8)));
+	seq_printf(s, "CTRL    0x84 = 0x%08x  [start=%u active_list=%u op_mode=%u comp_int=%u err_int=%u]\n",
+		   ctrl, !!(ctrl & BIT(0)), !!(ctrl & BIT(1)),
+		   (ctrl >> 5) & 3, !!(ctrl & BIT(8)), !!(ctrl & BIT(10)));
+	seq_printf(s, "PTC     0x8c = 0x%08x  (perf total cycles)\n",
+		   ioread32(d->bar + GNA_MMIO_PTC));
+	seq_printf(s, "PSC     0x90 = 0x%08x  (perf stall cycles)\n",
+		   ioread32(d->bar + GNA_MMIO_PSC));
+	seq_printf(s, "D0I3C   0xa8 = 0x%08x\n",
+		   ioread32(d->bar + GNA_MMIO_D0I3C));
+	seq_printf(s, "DESBASE 0xb0 = 0x%08x  (descriptor page-frame number)\n", desbase);
+	seq_printf(s, "IBUFFS  0xb4 = 0x%08x  (input buffer size)\n", ibuffs);
+
+	seq_printf(s, "\nPage-directory candidate @0x200 (%d x u32):\n", GNA_PGDIR_N);
+	for (i = 0; i < GNA_PGDIR_N; i++) {
+		u32 e = ioread32(d->bar + GNA_PGDIR_OFF + i * 4);
+
+		if (e != 0xffffffffu && e != 0) {
+			seq_printf(s, "  [%2d] 0x%08x\n", i, e);
+			valid++;
+		}
+	}
+	seq_printf(s, "  %d/%d entries differ from empty (0 / 0xffffffff)\n",
+		   valid, GNA_PGDIR_N);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(gmm_gna);
 
 /*
  * poke: safe writability probe of a single dword register.
@@ -304,6 +367,8 @@ static int gmm_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 					  &gmm_poke_fops);
 	d->dbg_sweep = debugfs_create_file("gmm_wake_sweep", 0644, NULL, d,
 					   &gmm_sweep_fops);
+	d->dbg_gna = debugfs_create_file("gmm_wake_gna", 0444, NULL, d,
+					 &gmm_gna_fops);
 	dev_info(&pdev->dev, "gmm_wake: dump=/sys/kernel/debug/gmm_wake poke=..._poke sweep=..._sweep\n");
 	return 0;
 
@@ -322,6 +387,7 @@ static void gmm_remove(struct pci_dev *pdev)
 		debugfs_remove(d->dbg);
 		debugfs_remove(d->dbg_poke);
 		debugfs_remove(d->dbg_sweep);
+		debugfs_remove(d->dbg_gna);
 		if (d->bar)
 			pci_iounmap(pdev, d->bar);
 		pci_release_region(pdev, 0);
