@@ -13,6 +13,8 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/fs.h>
+#include <linux/dma-mapping.h>
+#include <linux/delay.h>
 
 #define GMM_VENDOR 0x8086
 #define GMM_DEVICE 0x1911
@@ -27,8 +29,19 @@ struct gmm_dev {
 	struct dentry  *dbg_sweep;
 	struct dentry  *dbg_gna;
 	struct dentry  *dbg_wr;
+	struct dentry  *dbg_run;
 	char            result[320];
 	char            sweep[2048];
+
+	/* GMM job: coherent DMA buffers */
+	void           *desc_va;   /* hw descriptor page (DESBASE -> its PFN)  */
+	dma_addr_t      desc_dma;
+	void           *pt_va;     /* one page table                          */
+	dma_addr_t      pt_dma;
+	void           *data_va;   /* feature/mean/var/gconst/score data page  */
+	dma_addr_t      data_dma;
+	bool            built;
+	char            run[1024];  /* run status report */
 };
 
 #define POKE_PAT_A 0xA5A5A5A5u
@@ -129,6 +142,257 @@ static int gmm_gna_show(struct seq_file *s, void *unused)
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(gmm_gna);
+
+/* =======================================================================
+ *  GMM job: build a minimal GMM-scoring request and (optionally) fire it.
+ *  Extrapolated from the Intel GNA driver+library; offsets UNVERIFIED for
+ *  the pre-0.9 Skylake GMM (8086:1911). This is the risky part.
+ * ======================================================================= */
+
+/* Descriptor-page layout (DESBASE points at this page's PFN). */
+#define D_CFG      0x100   /* 128-byte GMM_CONFIG goes here       */
+#define D_VAMAX    0x200   /* u32 vamaxaddr                       */
+#define D_PGDIR    0x210   /* u32 pagedir_n[64]                   */
+#define GNA_PGDIRN_LEN   64
+#define GNA_PGDIR_INVALID 1
+
+/* GMM_CONFIG field byte-offsets within D_CFG. */
+#define C_FVADDR   0x00
+#define C_FVOFF    0x04
+#define C_FVWIDTH  0x08
+#define C_MODE     0x0c
+#define C_NUMFV    0x10
+#define C_VLENGTH  0x14
+#define C_MVADDR   0x18
+#define C_MVWIDTH  0x20
+#define C_MVSOFF   0x28
+#define C_VVADDR   0x30
+#define C_VVWIDTH  0x38
+#define C_VVSOFF   0x40
+#define C_GCADDR   0x44
+#define C_GCWIDTH  0x4c
+#define C_GCSOFF   0x50
+#define C_MAXLS    0x54
+#define C_MAXLSW   0x58
+#define C_NUMMCPG  0x5c
+#define C_GMMTELST 0x60
+#define C_NUMGMMS  0x64
+#define C_ASLADDR  0x68
+#define C_ASTLEN   0x70
+#define C_SCRWDTH  0x74
+#define C_SCRADD   0x78
+#define C_SCRLEN   0x7c
+
+/* Data-page layout. GNA-virtual addr == page offset (page mapped at virt 0). */
+#define V_FEATURE  0x000   /* 8 x u8   */
+#define V_MEAN     0x040   /* 8 x u8   */
+#define V_VAR      0x080   /* 8 x u8   */
+#define V_GCONST   0x0c0   /* 1 x s32  */
+#define V_SCORE    0x100   /* 1 x s32 (output) */
+
+#define GMM_VLEN   8       /* vector length (elements) */
+#define GMM_GCONST 1000    /* known Gaussian constant  */
+#define SCORE_SENTINEL 0xA5A5A5A5u
+
+/* MMIO (GNA map; unverified for 1911). */
+#define GNA_MMIO_STS     0x80
+#define GNA_MMIO_CTRL    0x84
+#define GNA_MMIO_DESBASE 0xb0
+#define GNA_CTRL_START   BIT(0)
+#define GNA_STS_DONE     BIT(0)
+#define GNA_STS_ERRMASK  (BIT(4) | BIT(5) | BIT(6) | BIT(7) | BIT(8))
+
+static inline void w32(void *base, u32 off, u32 v)
+{
+	*(u32 *)((u8 *)base + off) = v;   /* x86 LE, offsets are 4-aligned */
+}
+
+static int gmm_build(struct gmm_dev *d)
+{
+	u8 *data;
+	void *cfg;
+	int i;
+
+	if (!d->desc_va) {
+		d->desc_va = dma_alloc_coherent(&d->pdev->dev, PAGE_SIZE,
+						&d->desc_dma, GFP_KERNEL);
+		d->pt_va = dma_alloc_coherent(&d->pdev->dev, PAGE_SIZE,
+					      &d->pt_dma, GFP_KERNEL);
+		d->data_va = dma_alloc_coherent(&d->pdev->dev, PAGE_SIZE,
+						&d->data_dma, GFP_KERNEL);
+	}
+	if (!d->desc_va || !d->pt_va || !d->data_va)
+		return -ENOMEM;
+
+	memset(d->desc_va, 0, PAGE_SIZE);
+	memset(d->pt_va, 0, PAGE_SIZE);
+	memset(d->data_va, 0, PAGE_SIZE);
+
+	/* ---- data: feature == mean (so distance 0 -> score ~= gconst) ---- */
+	data = d->data_va;
+	for (i = 0; i < GMM_VLEN; i++) {
+		data[V_FEATURE + i] = 10 * (i + 1);  /* 10,20,...,80 */
+		data[V_MEAN    + i] = 10 * (i + 1);  /* identical     */
+		data[V_VAR     + i] = 1;             /* inverse covariance */
+	}
+	w32(data, V_GCONST, GMM_GCONST);
+	w32(data, V_SCORE, SCORE_SENTINEL);
+
+	/* ---- GMM_CONFIG (128 bytes) at descriptor offset 0x100 ---- */
+	cfg = (u8 *)d->desc_va + D_CFG;
+	w32(cfg, C_FVADDR,  V_FEATURE);
+	w32(cfg, C_FVOFF,   round_up(GMM_VLEN * 1, 64));
+	w32(cfg, C_FVWIDTH, 1);
+	w32(cfg, C_MODE,    0);              /* L2, no read-elimination */
+	w32(cfg, C_NUMFV,   1);
+	w32(cfg, C_VLENGTH, GMM_VLEN);
+	w32(cfg, C_MVADDR,  V_MEAN);
+	w32(cfg, C_MVWIDTH, 1);
+	w32(cfg, C_MVSOFF,  1 * GMM_VLEN * 1);
+	w32(cfg, C_VVADDR,  V_VAR);
+	w32(cfg, C_VVWIDTH, 1);
+	w32(cfg, C_VVSOFF,  1 * GMM_VLEN * 1);
+	w32(cfg, C_GCADDR,  V_GCONST);
+	w32(cfg, C_GCWIDTH, 4);
+	w32(cfg, C_GCSOFF,  round_up(1, 2) * 4);
+	w32(cfg, C_MAXLS,   0x7fffffff);
+	w32(cfg, C_MAXLSW,  4);
+	w32(cfg, C_NUMMCPG, 1);             /* mixtures per GMM */
+	w32(cfg, C_GMMTELST, 1 * GMM_VLEN);
+	w32(cfg, C_NUMGMMS, 1);             /* states */
+	w32(cfg, C_ASLADDR, 0);
+	w32(cfg, C_ASTLEN,  0);
+	w32(cfg, C_SCRWDTH, 4);
+	w32(cfg, C_SCRADD,  V_SCORE);
+	w32(cfg, C_SCRLEN,  4 * 1 * 1);
+
+	/* ---- MMU: one page table, one valid PTE -> data page ---- */
+	w32(d->pt_va, 0, (u32)(d->data_dma >> PAGE_SHIFT));
+
+	/* ---- descriptor MMU block: page directory + vamaxaddr ---- */
+	w32(d->desc_va, D_VAMAX, PAGE_SIZE - 1);
+	w32(d->desc_va, D_PGDIR, (u32)(d->pt_dma >> PAGE_SHIFT));
+	for (i = 1; i < GNA_PGDIRN_LEN; i++)
+		w32(d->desc_va, D_PGDIR + i * 4, GNA_PGDIR_INVALID);
+
+	/* ---- program DESBASE (PFN of the descriptor page) ---- */
+	iowrite32((u32)(d->desc_dma >> PAGE_SHIFT), d->bar + GNA_MMIO_DESBASE);
+
+	d->built = true;
+	scnprintf(d->run, sizeof(d->run),
+		"BUILT (not fired).\n"
+		"  desc  va=%p dma=%pad pfn=0x%llx\n"
+		"  pt    va=%p dma=%pad pfn=0x%llx\n"
+		"  data  va=%p dma=%pad pfn=0x%llx\n"
+		"  DESBASE(0xb0) <- 0x%llx\n"
+		"  GMM: vlen=%d numfv=1 mix=1 states=1, feature==mean, gconst=%d\n"
+		"  prediction: distance=0 -> score should relate to gconst(%d)\n"
+		"  write \"go\" to fire (hits CTRL START on undocumented silicon).\n",
+		d->desc_va, &d->desc_dma, (u64)(d->desc_dma >> PAGE_SHIFT),
+		d->pt_va, &d->pt_dma, (u64)(d->pt_dma >> PAGE_SHIFT),
+		d->data_va, &d->data_dma, (u64)(d->data_dma >> PAGE_SHIFT),
+		(u64)(d->desc_dma >> PAGE_SHIFT),
+		GMM_VLEN, GMM_GCONST, GMM_GCONST);
+	dev_info(&d->pdev->dev, "gmm_wake: GMM job BUILT, DESBASE=0x%llx\n",
+		 (u64)(d->desc_dma >> PAGE_SHIFT));
+	return 0;
+}
+
+static int gmm_fire(struct gmm_dev *d)
+{
+	u32 sts_before, sts;
+	u32 score;
+	int i, done = 0;
+
+	if (!d->built)
+		return -EINVAL;
+
+	w32(d->data_va, V_SCORE, SCORE_SENTINEL);   /* reset output sentinel */
+	wmb();
+
+	sts_before = ioread32(d->bar + GNA_MMIO_STS);
+
+	/* CTRL: START + OP_MODE=GMM(0), no interrupts (we poll). */
+	iowrite32(GNA_CTRL_START, d->bar + GNA_MMIO_CTRL);
+
+	/* Poll STS for done/error, up to ~100 ms. */
+	for (i = 0; i < 10000; i++) {
+		sts = ioread32(d->bar + GNA_MMIO_STS);
+		if (sts & (GNA_STS_DONE | GNA_STS_ERRMASK)) {
+			done = 1;
+			break;
+		}
+		udelay(10);
+	}
+	sts = ioread32(d->bar + GNA_MMIO_STS);
+	rmb();
+	score = *(u32 *)((u8 *)d->data_va + V_SCORE);
+
+	scnprintf(d->run, sizeof(d->run),
+		"FIRED.\n"
+		"  STS 0x80 before=0x%08x after=0x%08x\n"
+		"  poll: %s after ~%d us%s\n"
+		"  STS bits: done=%u err=0x%x\n"
+		"  score @data+0x%03x = 0x%08x (%d)  [sentinel was 0x%08x]\n"
+		"  gconst=%d  -> %s\n",
+		sts_before, sts,
+		done ? "settled" : "TIMED OUT", i * 10,
+		done ? "" : " (STS never signalled)",
+		!!(sts & GNA_STS_DONE), (unsigned int)(sts & GNA_STS_ERRMASK),
+		V_SCORE, score, score, SCORE_SENTINEL,
+		GMM_GCONST,
+		score != SCORE_SENTINEL ?
+			"OUTPUT CHANGED - hardware wrote the score!" :
+			"output unchanged (chip did not write; offsets likely differ)");
+	dev_info(&d->pdev->dev,
+		 "gmm_wake: FIRED sts %08x->%08x score=0x%08x done=%d\n",
+		 sts_before, sts, score, done);
+	return 0;
+}
+
+static ssize_t gmm_run_write(struct file *f, const char __user *ub,
+			     size_t len, loff_t *ppos)
+{
+	struct gmm_dev *d = f->private_data;
+	char kb[16];
+	int rc;
+
+	if (!d || !d->bar)
+		return -ENODEV;
+	if (len == 0 || len >= sizeof(kb))
+		return -EINVAL;
+	if (copy_from_user(kb, ub, len))
+		return -EFAULT;
+	kb[len] = '\0';
+	strim(kb);
+
+	if (!strncmp(kb, "build", 5))
+		rc = gmm_build(d);
+	else if (!strncmp(kb, "go", 2) || !strncmp(kb, "fire", 4))
+		rc = gmm_fire(d);
+	else
+		return -EINVAL;
+
+	return rc ? rc : len;
+}
+
+static ssize_t gmm_run_read(struct file *f, char __user *ub,
+			    size_t len, loff_t *ppos)
+{
+	struct gmm_dev *d = f->private_data;
+	const char *msg = d->run[0] ? d->run :
+		"write \"build\" to set up the GMM job, then \"go\" to fire\n";
+
+	return simple_read_from_buffer(ub, len, ppos, msg, strlen(msg));
+}
+
+static const struct file_operations gmm_run_fops = {
+	.owner  = THIS_MODULE,
+	.open   = simple_open,
+	.read   = gmm_run_read,
+	.write  = gmm_run_write,
+	.llseek = default_llseek,
+};
 
 /*
  * poke: safe writability probe of a single dword register.
@@ -409,6 +673,11 @@ static int gmm_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	pci_set_drvdata(pdev, d);
 
+	/* DMA: bus-master + 32-bit mask (GNA GEN1 uses 32-bit page addresses). */
+	pci_set_master(pdev);
+	if (dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32)))
+		dev_warn(&pdev->dev, "gmm_wake: 32-bit DMA mask not set\n");
+
 	r0 = ioread32(d->bar + 0);           /* first proof-of-life read */
 	dev_info(&pdev->dev,
 		 "gmm_wake: ALIVE. BAR0 mapped len=%llu, reg[0x00]=0x%08x\n",
@@ -423,7 +692,9 @@ static int gmm_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 					 &gmm_gna_fops);
 	d->dbg_wr = debugfs_create_file("gmm_wake_wr", 0644, NULL, d,
 					&gmm_wr_fops);
-	dev_info(&pdev->dev, "gmm_wake: dump=/sys/kernel/debug/gmm_wake poke=..._poke sweep=..._sweep\n");
+	d->dbg_run = debugfs_create_file("gmm_wake_run", 0644, NULL, d,
+					 &gmm_run_fops);
+	dev_info(&pdev->dev, "gmm_wake: dump/poke/sweep/gna/wr/run at /sys/kernel/debug/gmm_wake*\n");
 	return 0;
 
 err_release:
@@ -443,6 +714,13 @@ static void gmm_remove(struct pci_dev *pdev)
 		debugfs_remove(d->dbg_sweep);
 		debugfs_remove(d->dbg_gna);
 		debugfs_remove(d->dbg_wr);
+		debugfs_remove(d->dbg_run);
+		if (d->desc_va)
+			dma_free_coherent(&pdev->dev, PAGE_SIZE, d->desc_va, d->desc_dma);
+		if (d->pt_va)
+			dma_free_coherent(&pdev->dev, PAGE_SIZE, d->pt_va, d->pt_dma);
+		if (d->data_va)
+			dma_free_coherent(&pdev->dev, PAGE_SIZE, d->data_va, d->data_dma);
 		if (d->bar)
 			pci_iounmap(pdev, d->bar);
 		pci_release_region(pdev, 0);
