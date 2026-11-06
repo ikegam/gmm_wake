@@ -24,7 +24,9 @@ struct gmm_dev {
 	resource_size_t bar_len;
 	struct dentry  *dbg;
 	struct dentry  *dbg_poke;
+	struct dentry  *dbg_sweep;
 	char            result[320];
+	char            sweep[2048];
 };
 
 #define POKE_PAT_A 0xA5A5A5A5u
@@ -138,6 +140,121 @@ static const struct file_operations gmm_poke_fops = {
 	.llseek = default_llseek,
 };
 
+/* Probe one dword's writable-bit mask, restoring the original value. */
+static u32 gmm_probe_dword(struct gmm_dev *d, resource_size_t off)
+{
+	u32 orig = ioread32(d->bar + off);
+	u32 ra, rb;
+
+	iowrite32(POKE_PAT_A, d->bar + off);
+	ra = ioread32(d->bar + off);
+	iowrite32(POKE_PAT_B, d->bar + off);
+	rb = ioread32(d->bar + off);
+	iowrite32(orig, d->bar + off);          /* restore */
+	return ra ^ rb;                         /* writable-bit mask */
+}
+
+/*
+ * sweep: classify every dword in BAR0 as writable (full/partial) or not,
+ * total the writable "memory", list contiguous fully-writable ranges, and
+ * test whether the 0x800 and 0xc00 banks are independent or aliased.
+ */
+static void gmm_run_sweep(struct gmm_dev *d)
+{
+	resource_size_t off, run_start = 0;
+	u32 rw = 0, partial = 0, ro = 0;
+	bool in_run = false;
+	size_t u = 0;
+	size_t sz = sizeof(d->sweep);
+
+	u += scnprintf(d->sweep + u, sz - u,
+		       "Fully-writable (scratch) ranges:\n");
+
+	for (off = 0; off + 4 <= d->bar_len; off += 4) {
+		u32 wm = gmm_probe_dword(d, off);
+
+		if (wm == 0xffffffffu) {
+			rw++;
+			if (!in_run) { run_start = off; in_run = true; }
+		} else {
+			if (in_run) {
+				u += scnprintf(d->sweep + u, sz - u,
+					"  0x%03llx - 0x%03llx  (%llu B)\n",
+					(unsigned long long)run_start,
+					(unsigned long long)(off - 4),
+					(unsigned long long)(off - run_start));
+				in_run = false;
+			}
+			if (wm == 0)
+				ro++;
+			else
+				partial++;
+		}
+	}
+	if (in_run)
+		u += scnprintf(d->sweep + u, sz - u,
+			"  0x%03llx - 0x%03llx  (%llu B)\n",
+			(unsigned long long)run_start,
+			(unsigned long long)(d->bar_len - 4),
+			(unsigned long long)(d->bar_len - run_start));
+
+	/* Independence test for the two scratch banks, if both are writable. */
+	if (0x800 + 4 <= d->bar_len && 0xc00 + 4 <= d->bar_len &&
+	    gmm_probe_dword(d, 0x800) == 0xffffffffu &&
+	    gmm_probe_dword(d, 0xc00) == 0xffffffffu) {
+		u32 o8 = ioread32(d->bar + 0x800);
+		u32 oc = ioread32(d->bar + 0xc00);
+		u32 seen_c;
+
+		iowrite32(0xdeadbeefu, d->bar + 0x800);
+		seen_c = ioread32(d->bar + 0xc00);
+		iowrite32(o8, d->bar + 0x800);
+		iowrite32(oc, d->bar + 0xc00);
+		u += scnprintf(d->sweep + u, sz - u,
+			"0x800 vs 0xc00 : %s\n",
+			seen_c == 0xdeadbeefu ? "ALIASED (same RAM)"
+					      : "INDEPENDENT (two banks)");
+	}
+
+	u += scnprintf(d->sweep + u, sz - u,
+		"\nSummary: writable=%u dwords = %u bytes | partial=%u | ro/zero=%u | total=%llu dwords (%llu B BAR)\n",
+		rw, rw * 4, partial, ro,
+		(unsigned long long)(d->bar_len / 4),
+		(unsigned long long)d->bar_len);
+
+	dev_info(&d->pdev->dev,
+		 "gmm_wake: sweep done, writable=%u dwords (%u B)\n", rw, rw * 4);
+}
+
+static ssize_t gmm_sweep_write(struct file *f, const char __user *ub,
+			       size_t len, loff_t *ppos)
+{
+	struct gmm_dev *d = f->private_data;
+
+	if (!d || !d->bar)
+		return -ENODEV;
+	gmm_run_sweep(d);
+	return len;
+}
+
+static ssize_t gmm_sweep_read(struct file *f, char __user *ub,
+			      size_t len, loff_t *ppos)
+{
+	struct gmm_dev *d = f->private_data;
+	const char *msg = d->sweep[0] ? d->sweep :
+		"write anything here to run a full BAR0 writability sweep\n";
+
+	return simple_read_from_buffer(ub, len, ppos, msg, strlen(msg));
+}
+
+static const struct file_operations gmm_sweep_fops = {
+	.owner  = THIS_MODULE,
+	.open   = simple_open,
+	.read   = gmm_sweep_read,
+	.write  = gmm_sweep_write,
+	.llseek = default_llseek,
+};
+
 static int gmm_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct gmm_dev *d;
@@ -182,7 +299,9 @@ static int gmm_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	d->dbg = debugfs_create_file("gmm_wake", 0444, NULL, d, &gmm_regs_fops);
 	d->dbg_poke = debugfs_create_file("gmm_wake_poke", 0644, NULL, d,
 					  &gmm_poke_fops);
-	dev_info(&pdev->dev, "gmm_wake: dump at /sys/kernel/debug/gmm_wake, probe at /sys/kernel/debug/gmm_wake_poke\n");
+	d->dbg_sweep = debugfs_create_file("gmm_wake_sweep", 0644, NULL, d,
+					   &gmm_sweep_fops);
+	dev_info(&pdev->dev, "gmm_wake: dump=/sys/kernel/debug/gmm_wake poke=..._poke sweep=..._sweep\n");
 	return 0;
 
 err_release:
@@ -199,6 +318,7 @@ static void gmm_remove(struct pci_dev *pdev)
 	if (d) {
 		debugfs_remove(d->dbg);
 		debugfs_remove(d->dbg_poke);
+		debugfs_remove(d->dbg_sweep);
 		if (d->bar)
 			pci_iounmap(pdev, d->bar);
 		pci_release_region(pdev, 0);
