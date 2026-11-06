@@ -15,6 +15,9 @@
 #include <linux/fs.h>
 #include <linux/dma-mapping.h>
 #include <linux/delay.h>
+#include <linux/interrupt.h>
+#include <linux/wait.h>
+#include <linux/sched.h>
 
 #define GMM_VENDOR 0x8086
 #define GMM_DEVICE 0x1911
@@ -42,6 +45,13 @@ struct gmm_dev {
 	dma_addr_t      data_dma;
 	bool            built;
 	char            run[1024];  /* run status report */
+
+	/* completion interrupt: CPU sleeps until the chip signals */
+	int                irq;
+	bool               irq_ok;      /* MSI successfully set up */
+	wait_queue_head_t  wq;
+	bool               completed;   /* set by ISR */
+	u32                irq_sts;     /* STS latched by ISR */
 };
 
 #define POKE_PAT_A 0xA5A5A5A5u
@@ -199,7 +209,10 @@ DEFINE_SHOW_ATTRIBUTE(gmm_gna);
 #define GNA_MMIO_STS     0x80
 #define GNA_MMIO_CTRL    0x84
 #define GNA_MMIO_DESBASE 0xb0
-#define GNA_CTRL_START   BIT(0)
+#define GNA_CTRL_START    BIT(0)
+#define GNA_CTRL_ABORT    BIT(2)
+#define GNA_CTRL_COMP_INT BIT(8)    /* completion interrupt enable */
+#define GNA_CTRL_ERR_INT  BIT(10)   /* error interrupt enable */
 #define GNA_STS_DONE     BIT(0)
 #define GNA_STS_ERRMASK  (BIT(4) | BIT(5) | BIT(6) | BIT(7) | BIT(8))
 
@@ -338,11 +351,32 @@ static int gmm_build(struct gmm_dev *d)
 	return 0;
 }
 
+/*
+ * Completion interrupt handler. The chip raises its MSI when scoring finishes
+ * (or errors); we latch STS, quiesce (abort) to deassert, and wake the sleeper.
+ */
+static irqreturn_t gmm_isr(int irq, void *dev)
+{
+	struct gmm_dev *d = dev;
+	u32 sts = ioread32(d->bar + GNA_MMIO_STS);
+
+	if (!(sts & (GNA_STS_DONE | GNA_STS_ERRMASK)))
+		return IRQ_NONE;
+
+	d->irq_sts = sts;
+	iowrite32(GNA_CTRL_ABORT, d->bar + GNA_MMIO_CTRL);  /* clear/deassert */
+	smp_wmb();
+	d->completed = true;
+	wake_up(&d->wq);
+	return IRQ_HANDLED;
+}
+
 static int gmm_fire(struct gmm_dev *d)
 {
 	u32 sts_before, sts;
 	u32 score;
 	int i, done = 0;
+	bool by_irq = false;
 
 	if (!d->built)
 		return -EINVAL;
@@ -351,20 +385,37 @@ static int gmm_fire(struct gmm_dev *d)
 	wmb();
 
 	sts_before = ioread32(d->bar + GNA_MMIO_STS);
+	d->completed = false;
+	d->irq_sts = 0;
 
-	/* CTRL: START + OP_MODE=GMM(0), no interrupts (we poll). */
-	iowrite32(GNA_CTRL_START, d->bar + GNA_MMIO_CTRL);
-
-	/* Poll STS for done/error, up to ~100 ms. */
-	for (i = 0; i < 10000; i++) {
-		sts = ioread32(d->bar + GNA_MMIO_STS);
-		if (sts & (GNA_STS_DONE | GNA_STS_ERRMASK)) {
+	if (d->irq_ok) {
+		/* Interrupt-driven: arm with completion+error IRQs, then SLEEP. */
+		iowrite32(GNA_CTRL_START | GNA_CTRL_COMP_INT | GNA_CTRL_ERR_INT,
+			  d->bar + GNA_MMIO_CTRL);
+		/* The CPU is idle here until the chip's interrupt wakes us. */
+		wait_event_timeout(d->wq, d->completed, msecs_to_jiffies(1000));
+		if (d->completed) {
+			by_irq = true;
 			done = 1;
-			break;
+			sts = d->irq_sts;
+		} else {
+			/* No IRQ arrived; fall back to reading STS directly. */
+			sts = ioread32(d->bar + GNA_MMIO_STS);
+			done = !!(sts & (GNA_STS_DONE | GNA_STS_ERRMASK));
 		}
-		udelay(10);
+	} else {
+		/* Fallback: poll STS (no MSI available). */
+		iowrite32(GNA_CTRL_START, d->bar + GNA_MMIO_CTRL);
+		for (i = 0; i < 10000; i++) {
+			sts = ioread32(d->bar + GNA_MMIO_STS);
+			if (sts & (GNA_STS_DONE | GNA_STS_ERRMASK)) {
+				done = 1;
+				break;
+			}
+			udelay(10);
+		}
+		sts = ioread32(d->bar + GNA_MMIO_STS);
 	}
-	sts = ioread32(d->bar + GNA_MMIO_STS);
 	rmb();
 	score = *(u32 *)((u8 *)d->data_va + V_SCORE);
 
@@ -385,13 +436,17 @@ static int gmm_fire(struct gmm_dev *d)
 		}
 		scnprintf(d->run, sizeof(d->run),
 			"FIRED.\n"
-			"  STS 0x80 before=0x%08x after=0x%08x  done=%u err=0x%x (~%d us)\n"
+			"  wakeup    : %s\n"
+			"  STS 0x80 before=0x%08x after=0x%08x  done=%u err=0x%x\n"
 			"  HW score  = %u (0x%08x)\n"
 			"  CPU ref   = %u (= gconst %u + Sum var*(feat-mean)^2 over %d elems)\n"
 			"  VERDICT   : %s\n",
+			by_irq ? "INTERRUPT (CPU slept until the chip signalled)" :
+				 (d->irq_ok ? "timed out waiting for IRQ (read STS directly)" :
+					      "polled (no MSI)"),
 			sts_before, sts,
 			!!(sts & GNA_STS_DONE), (unsigned int)(sts & GNA_STS_ERRMASK),
-			i * 10, score, score, expected, GMM_GCONST, GMM_VLEN,
+			score, score, expected, GMM_GCONST, GMM_VLEN,
 			(done && !(sts & GNA_STS_ERRMASK) && score == expected) ?
 				"PASS - hardware GMM result matches CPU reference" :
 				(score == SCORE_SENTINEL ?
@@ -732,6 +787,22 @@ static int gmm_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32)))
 		dev_warn(&pdev->dev, "gmm_wake: 32-bit DMA mask not set\n");
 
+	/* Completion interrupt (single MSI), so the CPU can sleep until done. */
+	init_waitqueue_head(&d->wq);
+	rc = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_ALL_TYPES);
+	if (rc == 1) {
+		d->irq = pci_irq_vector(pdev, 0);
+		if (request_irq(d->irq, gmm_isr, 0, "gmm_wake", d) == 0) {
+			d->irq_ok = true;
+			dev_info(&pdev->dev, "gmm_wake: MSI irq %d ready\n", d->irq);
+		} else {
+			pci_free_irq_vectors(pdev);
+			dev_warn(&pdev->dev, "gmm_wake: request_irq failed; polling\n");
+		}
+	} else {
+		dev_warn(&pdev->dev, "gmm_wake: no MSI (%d); polling\n", rc);
+	}
+
 	r0 = ioread32(d->bar + 0);           /* first proof-of-life read */
 	dev_info(&pdev->dev,
 		 "gmm_wake: ALIVE. BAR0 mapped len=%llu, reg[0x00]=0x%08x\n",
@@ -769,6 +840,10 @@ static void gmm_remove(struct pci_dev *pdev)
 		debugfs_remove(d->dbg_gna);
 		debugfs_remove(d->dbg_wr);
 		debugfs_remove(d->dbg_run);
+		if (d->irq_ok) {
+			free_irq(d->irq, d);
+			pci_free_irq_vectors(pdev);
+		}
 		if (d->desc_va)
 			dma_free_coherent(&pdev->dev, PAGE_SIZE, d->desc_va, d->desc_dma);
 		if (d->pt_va)
