@@ -26,6 +26,8 @@ const NMEL: usize = 24;          // feature dim == GMM vlen
 const GATE_PATH: &str = "gate.txt";
 
 // gate dynamics
+const ATTACK_FRAMES: i32 = 4;    // need ~32 ms of continuous speech to open
+                                 // (rejects impulsive noise: chip crunch, clicks)
 const HANG_FRAMES: i32 = 20;     // keep gate open ~160 ms after last speech
 const FADE_SAMPLES: f32 = 96.0;  // ~6 ms sample-level fade (anti-click)
 
@@ -492,13 +494,16 @@ fn cmd_calibrate() {
     let gmm = Gmm::open().expect("open /dev/gmm0");
     let mut mic = Mic::start(None);
 
-    // Phase 1: room noise - stay quiet.
-    eprintln!("[calibrate] STAY QUIET for the noise sample ...");
-    let (nz_frames, nz_e) = record_frames(&mut mic, &dsp, 3.0, "noise");
+    // Phase 1: NON-speech. Capture real interfering sounds (typing, clapping,
+    // eating, fan) plus some silence - everything that must NOT open the gate.
+    // The noise Gaussian learns them, so later they score as noise, not speech.
+    eprintln!("[calibrate] NON-SPEECH sample: DON'T talk. Make your usual noises -");
+    eprintln!("[calibrate]   type, clap, eat chips, rustle, let the fan run, then go quiet.");
+    let (nz_frames, nz_e) = record_frames(&mut mic, &dsp, 6.0, "noise");
     let noise_floor = {
         let mut v = nz_e.clone();
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        v[v.len() / 2].max(1e-6) // median
+        v[v.len() / 5].max(1e-6) // 20th pct: the quiet level, robust to noise bursts
     };
     let (nz_mean, nz_var) = build_class(&nz_frames);
 
@@ -590,6 +595,7 @@ fn cmd_run(out: Output) {
     let mut hop = [0f32; HOP];
     let mut gain = 0f32;       // current output gain (smoothed)
     let mut hold: i32 = 0;     // hangover counter
+    let mut speech_run: i32 = 0; // consecutive speech-classified frames (attack)
     let mut open_prev = false;
     let mut frames = 0u64;
     let mut open_frames = 0u64;
@@ -619,7 +625,10 @@ fn cmd_run(out: Output) {
         let ns = gmm.score(&qf, &model.nz_mean, &model.nz_var) as i32;
         let is_speech = ss + model.bias < ns;
 
-        if is_speech { hold = HANG_FRAMES; } else if hold > 0 { hold -= 1; }
+        // require ATTACK_FRAMES of continuous speech to (re)open: a lone
+        // transient (clap, chip crunch, click) never sustains that long.
+        if is_speech { speech_run += 1; } else { speech_run = 0; }
+        if speech_run >= ATTACK_FRAMES { hold = HANG_FRAMES; } else if hold > 0 { hold -= 1; }
         let gate_open = hold > 0;
         let target_gain = if gate_open { 1.0 } else { 0.0 };
 
@@ -710,6 +719,7 @@ fn cmd_gatefile(inp: &str, outp: &str) {
     let mut wav = WavOut::create(outp);
     let mut gain = 0f32;
     let mut hold: i32 = 0;
+    let mut speech_run: i32 = 0;
     let (mut frames, mut open_frames) = (0u64, 0u64);
     let step = 1.0 / FADE_SAMPLES;
     let mut pos = 0usize;
@@ -719,7 +729,8 @@ fn cmd_gatefile(inp: &str, outp: &str) {
         let ss = gmm.score(&qf, &model.sp_mean, &model.sp_var) as i32;
         let ns = gmm.score(&qf, &model.nz_mean, &model.nz_var) as i32;
         let is_speech = ss + model.bias < ns;
-        if is_speech { hold = HANG_FRAMES; } else if hold > 0 { hold -= 1; }
+        if is_speech { speech_run += 1; } else { speech_run = 0; }
+        if speech_run >= ATTACK_FRAMES { hold = HANG_FRAMES; } else if hold > 0 { hold -= 1; }
         let gate_open = hold > 0;
         let target_gain = if gate_open { 1.0 } else { 0.0 };
         let newest = &frame[FRAME - HOP..];
