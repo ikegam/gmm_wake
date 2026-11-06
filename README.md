@@ -89,6 +89,35 @@ debugfs interface (`/sys/kernel/debug/gmm_wake*`): `gmm_wake` (register dump),
 probe/write), `_sweep` (writability map). `gmmctl` is a helper for the
 build/go/poke cycle.
 
+## Userland: `/dev/gmm0`
+
+The module exposes a character device with one synchronous ioctl, `GMM_COMPUTE`
+(see [`gmm_uapi.h`](gmm_uapi.h)). Fill in a feature vector and a GMM model
+(mean/variance per element + a Gaussian constant); the call blocks — the CPU
+**sleeps until the chip's interrupt wakes it** — and returns the score.
+
+```c
+int fd = open("/dev/gmm0", O_RDWR);
+struct gmm_job j = { .vlen = 24, .gconst = 1000 };
+/* fill j.feature[], j.mean[], j.var[] ... */
+ioctl(fd, GMM_COMPUTE, &j);
+/* j.score = gconst + Sum var*(feature-mean)^2, computed by the chip */
+```
+
+`gmm_test.c` is a reference user program (`make` builds it) that submits jobs and
+checks each against a CPU reference:
+
+```
+run 0: HW=142760  CPU=142760  sts=0x1  -> PASS
+run 1: HW=215800  CPU=215800  sts=0x1  -> PASS
+run 2: HW=309120  CPU=309120  sts=0x1  -> PASS
+ALL PASS - userspace drove the GMM chip
+```
+
+This is the chip's real usage model: a userspace process arms a job and idles
+(the accelerator does the math at low power and signals completion by interrupt).
+The planned market-watch app will be a Rust userland on top of this `/dev/gmm0`.
+
 ## Milestones
 
 - [x] Bind a custom driver to `8086:1911` (no driver exists anywhere)
@@ -100,7 +129,9 @@ build/go/poke cycle.
 - [x] Run a GMM scoring op to completion (`done=1`) with a working data path
 - [x] **Compute a real, feature-dependent GMM score, bit-exact vs a CPU
       reference** (the fix: `vlength` must be ≥ 24; 8 is reserved)
-- [ ] Repurpose as a market-wave "wake-word" detector (see below)
+- [x] Interrupt-driven completion — the CPU sleeps until the chip signals
+- [x] Userland `/dev/gmm0` (ioctl `GMM_COMPUTE`), verified from a user program
+- [ ] Repurpose as a market-wave "wake-word" detector (Rust on `/dev/gmm0`)
 
 ## ⚠️ Warnings
 

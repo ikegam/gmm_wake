@@ -14,3 +14,6 @@ Module.symvers
 *.a
 *.d
 .cache.mk
+
+# userspace test binary
+gmm_test

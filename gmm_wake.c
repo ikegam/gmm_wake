@@ -18,6 +18,9 @@
 #include <linux/interrupt.h>
 #include <linux/wait.h>
 #include <linux/sched.h>
+#include <linux/mutex.h>
+#include <linux/miscdevice.h>
+#include "gmm_uapi.h"
 
 #define GMM_VENDOR 0x8086
 #define GMM_DEVICE 0x1911
@@ -52,6 +55,13 @@ struct gmm_dev {
 	wait_queue_head_t  wq;
 	bool               completed;   /* set by ISR */
 	u32                irq_sts;     /* STS latched by ISR */
+
+	/* last fire result (shared by debugfs fire and the ioctl path) */
+	u32                last_score;
+	u32                last_sts;
+	bool               last_by_irq;
+	bool               last_done;
+	struct mutex       lock;        /* serialize jobs */
 };
 
 #define POKE_PAT_A 0xA5A5A5A5u
@@ -221,6 +231,94 @@ static inline void w32(void *base, u32 off, u32 v)
 	*(u32 *)((u8 *)base + off) = v;   /* x86 LE, offsets are 4-aligned */
 }
 
+static int gmm_ensure_bufs(struct gmm_dev *d)
+{
+	if (!d->desc_va) {
+		d->desc_va = dma_alloc_coherent(&d->pdev->dev, PAGE_SIZE,
+						&d->desc_dma, GFP_KERNEL);
+		d->pt_va = dma_alloc_coherent(&d->pdev->dev, PAGE_SIZE,
+					      &d->pt_dma, GFP_KERNEL);
+		d->data_va = dma_alloc_coherent(&d->pdev->dev, PAGE_SIZE,
+						&d->data_dma, GFP_KERNEL);
+	}
+	if (!d->desc_va || !d->pt_va || !d->data_va)
+		return -ENOMEM;
+	return 0;
+}
+
+/* Valid GMM vector lengths. HW minimum is 24; 8 (and 64) are reserved. */
+static bool gmm_vlen_ok(u32 v)
+{
+	switch (v) {
+	case 24: case 32: case 40: case 48:
+	case 56: case 72: case 80: case 88: case 96:
+		return true;
+	}
+	return false;
+}
+
+/*
+ * Program a single-state / single-mixture / diagonal GMM for `vlen` elements.
+ * The data page must already hold feature/mean/var/gconst and the score
+ * sentinel. Quiesces, writes GMM_CONFIG into BAR0 0x00, sets up the 2-level
+ * MMU, DESBASE and the 0x404 address-range limit.
+ */
+static void gmm_program(struct gmm_dev *d, u32 vlen)
+{
+	void *cfg = (u8 *)d->desc_va + D_CFG;
+	int i;
+
+	/* quiesce: clear any latched START so the chip can't auto-fire mid-build */
+	iowrite32(GNA_CTRL_ABORT, d->bar + GNA_MMIO_CTRL);
+	udelay(50);
+	iowrite32(0, d->bar + GNA_MMIO_CTRL);
+
+	memset(d->desc_va, 0, PAGE_SIZE);
+	memset(d->pt_va, 0, PAGE_SIZE);
+
+	w32(cfg, C_FVADDR,  VBASE + V_FEATURE);
+	w32(cfg, C_FVOFF,   round_up(vlen * 1, 64));
+	w32(cfg, C_FVWIDTH, 1);
+	w32(cfg, C_MODE,    0);
+	w32(cfg, C_NUMFV,   1);
+	w32(cfg, C_VLENGTH, vlen);
+	w32(cfg, C_MVADDR,  VBASE + V_MEAN);
+	w32(cfg, C_MVWIDTH, 1);
+	w32(cfg, C_MVSOFF,  vlen);
+	w32(cfg, C_VVADDR,  VBASE + V_VAR);
+	w32(cfg, C_VVWIDTH, 1);
+	w32(cfg, C_VVSOFF,  vlen);
+	w32(cfg, C_GCADDR,  VBASE + V_GCONST);
+	w32(cfg, C_GCWIDTH, 4);
+	w32(cfg, C_GCSOFF,  round_up(1, 2) * 4);
+	w32(cfg, C_MAXLS,   0xffffffff);
+	w32(cfg, C_MAXLSW,  4);
+	w32(cfg, C_NUMMCPG, 1);
+	w32(cfg, C_GMMTELST, vlen);
+	w32(cfg, C_NUMGMMS, 1);
+	w32(cfg, C_ASLADDR, 0);
+	w32(cfg, C_ASTLEN,  0);
+	w32(cfg, C_SCRWDTH, 4);
+	w32(cfg, C_SCRADD,  VBASE + V_SCORE);
+	w32(cfg, C_SCRLEN,  4);
+
+	for (i = 0; i < 128; i += 4)
+		iowrite32(*(u32 *)((u8 *)cfg + i), d->bar + i);   /* config -> BAR0 0x00 */
+
+	w32(d->pt_va, 1 * 4, (u32)(d->data_dma >> PAGE_SHIFT)); /* pt[1] -> data (VA 0x1000) */
+	iowrite32((u32)(d->pt_dma >> PAGE_SHIFT), d->bar + 0x200);
+	for (i = 1; i < GNA_PGDIRN_LEN; i++)
+		iowrite32(GNA_PGDIR_INVALID, d->bar + 0x200 + i * 4);
+
+	w32(d->desc_va, D_VAMAX, 2 * PAGE_SIZE - 1);
+	w32(d->desc_va, D_PGDIR, (u32)(d->pt_dma >> PAGE_SHIFT));
+	for (i = 1; i < GNA_PGDIRN_LEN; i++)
+		w32(d->desc_va, D_PGDIR + i * 4, GNA_PGDIR_INVALID);
+	iowrite32((u32)(d->desc_dma >> PAGE_SHIFT), d->bar + GNA_MMIO_DESBASE);
+
+	iowrite32(0x7fffffffu, d->bar + 0x404);   /* address-range limit (vamaxaddr) */
+}
+
 static int gmm_build(struct gmm_dev *d)
 {
 	u8 *data;
@@ -371,35 +469,26 @@ static irqreturn_t gmm_isr(int irq, void *dev)
 	return IRQ_HANDLED;
 }
 
-static int gmm_fire(struct gmm_dev *d)
+/* Arm and run one scoring op; results land in d->last_*. */
+static void gmm_fire_core(struct gmm_dev *d)
 {
-	u32 sts_before, sts;
-	u32 score;
-	int i, done = 0;
-	bool by_irq = false;
-
-	if (!d->built)
-		return -EINVAL;
+	bool by_irq = false, done = false;
+	u32 sts = 0;
+	int i;
 
 	w32(d->data_va, V_SCORE, SCORE_SENTINEL);   /* reset output sentinel */
 	wmb();
-
-	sts_before = ioread32(d->bar + GNA_MMIO_STS);
 	d->completed = false;
 	d->irq_sts = 0;
 
 	if (d->irq_ok) {
-		/* Interrupt-driven: arm with completion+error IRQs, then SLEEP. */
+		/* Interrupt-driven: arm completion+error IRQs, then SLEEP. */
 		iowrite32(GNA_CTRL_START | GNA_CTRL_COMP_INT | GNA_CTRL_ERR_INT,
 			  d->bar + GNA_MMIO_CTRL);
-		/* The CPU is idle here until the chip's interrupt wakes us. */
 		wait_event_timeout(d->wq, d->completed, msecs_to_jiffies(1000));
 		if (d->completed) {
-			by_irq = true;
-			done = 1;
-			sts = d->irq_sts;
+			by_irq = true; done = true; sts = d->irq_sts;
 		} else {
-			/* No IRQ arrived; fall back to reading STS directly. */
 			sts = ioread32(d->bar + GNA_MMIO_STS);
 			done = !!(sts & (GNA_STS_DONE | GNA_STS_ERRMASK));
 		}
@@ -409,7 +498,7 @@ static int gmm_fire(struct gmm_dev *d)
 		for (i = 0; i < 10000; i++) {
 			sts = ioread32(d->bar + GNA_MMIO_STS);
 			if (sts & (GNA_STS_DONE | GNA_STS_ERRMASK)) {
-				done = 1;
+				done = true;
 				break;
 			}
 			udelay(10);
@@ -417,7 +506,25 @@ static int gmm_fire(struct gmm_dev *d)
 		sts = ioread32(d->bar + GNA_MMIO_STS);
 	}
 	rmb();
-	score = *(u32 *)((u8 *)d->data_va + V_SCORE);
+	d->last_sts    = sts;
+	d->last_by_irq = by_irq;
+	d->last_done   = done;
+	d->last_score  = *(u32 *)((u8 *)d->data_va + V_SCORE);
+}
+
+static int gmm_fire(struct gmm_dev *d)
+{
+	u32 sts, score;
+	bool by_irq, done;
+
+	if (!d->built)
+		return -EINVAL;
+
+	mutex_lock(&d->lock);
+	gmm_fire_core(d);
+	mutex_unlock(&d->lock);
+	sts = d->last_sts; score = d->last_score;
+	by_irq = d->last_by_irq; done = d->last_done;
 
 	/*
 	 * CPU reference of the exact GNA GMM kernel math, computed from the same
@@ -437,14 +544,14 @@ static int gmm_fire(struct gmm_dev *d)
 		scnprintf(d->run, sizeof(d->run),
 			"FIRED.\n"
 			"  wakeup    : %s\n"
-			"  STS 0x80 before=0x%08x after=0x%08x  done=%u err=0x%x\n"
+			"  STS 0x80   = 0x%08x  done=%u err=0x%x\n"
 			"  HW score  = %u (0x%08x)\n"
 			"  CPU ref   = %u (= gconst %u + Sum var*(feat-mean)^2 over %d elems)\n"
 			"  VERDICT   : %s\n",
 			by_irq ? "INTERRUPT (CPU slept until the chip signalled)" :
 				 (d->irq_ok ? "timed out waiting for IRQ (read STS directly)" :
 					      "polled (no MSI)"),
-			sts_before, sts,
+			sts,
 			!!(sts & GNA_STS_DONE), (unsigned int)(sts & GNA_STS_ERRMASK),
 			score, score, expected, GMM_GCONST, GMM_VLEN,
 			(done && !(sts & GNA_STS_ERRMASK) && score == expected) ?
@@ -454,10 +561,83 @@ static int gmm_fire(struct gmm_dev *d)
 					"MISMATCH - see values above"));
 	}
 	dev_info(&d->pdev->dev,
-		 "gmm_wake: FIRED sts %08x->%08x score=0x%08x done=%d\n",
-		 sts_before, sts, score, done);
+		 "gmm_wake: FIRED sts=0x%08x score=0x%08x done=%d irq=%d\n",
+		 sts, score, done, by_irq);
 	return 0;
 }
+
+/* =======================  /dev/gmm0 (userland)  ======================= */
+
+static struct gmm_dev *gmm_the_dev;   /* single chip */
+
+/* Run one GMM job from userspace: load model+input, fire (CPU sleeps), return score. */
+static long gmm_compute_job(struct gmm_dev *d, struct gmm_job *job)
+{
+	u8 *data;
+	u32 i;
+
+	if (!gmm_vlen_ok(job->vlen))
+		return -EINVAL;
+
+	mutex_lock(&d->lock);
+	if (gmm_ensure_bufs(d)) {
+		mutex_unlock(&d->lock);
+		return -ENOMEM;
+	}
+	data = d->data_va;
+	memset(data, 0, PAGE_SIZE);
+	for (i = 0; i < job->vlen; i++) {
+		data[V_FEATURE + i] = job->feature[i];
+		data[V_MEAN + i]    = job->mean[i];
+		data[V_VAR + i]     = job->var[i];
+	}
+	w32(data, V_GCONST, job->gconst);
+	w32(data, V_SCORE, SCORE_SENTINEL);
+
+	gmm_program(d, job->vlen);
+	gmm_fire_core(d);
+	mutex_unlock(&d->lock);
+
+	job->score = d->last_score;
+	job->hw_status = d->last_sts;
+	if (!d->last_done || (d->last_sts & GNA_STS_ERRMASK))
+		return -EIO;
+	return 0;
+}
+
+static long gmm_dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+{
+	struct gmm_dev *d = gmm_the_dev;
+	struct gmm_job *job;
+	long rc;
+
+	if (!d)
+		return -ENODEV;
+	if (cmd != GMM_COMPUTE)
+		return -ENOTTY;
+
+	job = memdup_user((void __user *)arg, sizeof(*job));
+	if (IS_ERR(job))
+		return PTR_ERR(job);
+
+	rc = gmm_compute_job(d, job);
+	if (!rc && copy_to_user((void __user *)arg, job, sizeof(*job)))
+		rc = -EFAULT;
+	kfree(job);
+	return rc;
+}
+
+static const struct file_operations gmm_dev_fops = {
+	.owner          = THIS_MODULE,
+	.unlocked_ioctl = gmm_dev_ioctl,
+};
+
+static struct miscdevice gmm_miscdev = {
+	.minor = MISC_DYNAMIC_MINOR,
+	.name  = "gmm0",
+	.fops  = &gmm_dev_fops,
+	.mode  = 0666,   /* experiment box: let non-root run jobs */
+};
 
 static ssize_t gmm_run_write(struct file *f, const char __user *ub,
 			     size_t len, loff_t *ppos)
@@ -789,6 +969,7 @@ static int gmm_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	/* Completion interrupt (single MSI), so the CPU can sleep until done. */
 	init_waitqueue_head(&d->wq);
+	mutex_init(&d->lock);
 	rc = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_ALL_TYPES);
 	if (rc == 1) {
 		d->irq = pci_irq_vector(pdev, 0);
@@ -819,6 +1000,14 @@ static int gmm_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 					&gmm_wr_fops);
 	d->dbg_run = debugfs_create_file("gmm_wake_run", 0644, NULL, d,
 					 &gmm_run_fops);
+
+	/* userland interface: /dev/gmm0 */
+	gmm_the_dev = d;
+	if (misc_register(&gmm_miscdev) == 0)
+		dev_info(&pdev->dev, "gmm_wake: /dev/gmm0 ready (ioctl GMM_COMPUTE)\n");
+	else
+		gmm_the_dev = NULL;
+
 	dev_info(&pdev->dev, "gmm_wake: dump/poke/sweep/gna/wr/run at /sys/kernel/debug/gmm_wake*\n");
 	return 0;
 
@@ -834,6 +1023,10 @@ static void gmm_remove(struct pci_dev *pdev)
 	struct gmm_dev *d = pci_get_drvdata(pdev);
 
 	if (d) {
+		if (gmm_the_dev == d) {
+			misc_deregister(&gmm_miscdev);
+			gmm_the_dev = NULL;
+		}
 		debugfs_remove(d->dbg);
 		debugfs_remove(d->dbg_poke);
 		debugfs_remove(d->dbg_sweep);
