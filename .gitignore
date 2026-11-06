@@ -21,3 +21,5 @@ gmm_test
 # rust build + model
 sessionwake/target/
 sessionwake/model.txt
+sessiongate/target/
+sessiongate/gate.txt
