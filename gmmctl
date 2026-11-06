@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# gmmctl - privileged helper for the gmm_wake reverse-engineering experiment.
+#
+# Installed root-owned and invoked through a scoped NOPASSWD sudoers rule so the
+# build/go/poke cycle can be iterated without interactive auth. It ONLY touches
+# the gmm_wake module and its debugfs files — nothing else.
+#
+# WARNING: `go`/`cycle` write CTRL START on undocumented silicon and can hang
+# the machine (recover with a power reboot).
+set -u
+
+KO=/home/ikegam/Work/this/gmm_wake/gmm_wake.ko
+DBG=/sys/kernel/debug/gmm_wake
+
+case "${1:-}" in
+  reload)
+    rmmod gmm_wake 2>/dev/null
+    insmod "$KO" && echo "loaded $(modinfo -F vermagic "$KO" 2>/dev/null)"
+    ;;
+  rmmod)
+    rmmod gmm_wake 2>/dev/null; echo "unloaded"
+    ;;
+  build)  echo build > "${DBG}_run"; cat "${DBG}_run" ;;
+  go)     echo go    > "${DBG}_run"; cat "${DBG}_run" ;;
+  status) cat "${DBG}_run" ;;
+  gna)    cat "${DBG}_gna" ;;
+  dump)   cat "${DBG}" ;;
+  wr)     # gmmctl wr <off> <val>
+    echo "${2:?off} ${3:?val}" > "${DBG}_wr"; cat "${DBG}_wr" ;;
+  cycle)  # reload + build + go in one shot
+    rmmod gmm_wake 2>/dev/null
+    insmod "$KO" || exit 1
+    echo build > "${DBG}_run"
+    echo go    > "${DBG}_run"
+    cat "${DBG}_run"
+    ;;
+  *)
+    echo "usage: gmmctl {reload|rmmod|build|go|cycle|status|gna|dump|wr <off> <val>}"
+    exit 2
+    ;;
+esac
